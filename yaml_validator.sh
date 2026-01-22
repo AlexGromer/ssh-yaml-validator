@@ -27,7 +27,6 @@ fi
 TOTAL_FILES=0
 PASSED_FILES=0
 FAILED_FILES=0
-REPORT_FILE=""
 ERRORS_FOUND=()
 
 print_header() {
@@ -121,7 +120,6 @@ check_indentation() {
     local file="$1"
     local line_num=0
     local errors=()
-    local prev_indent=0
     local indent_size=0
     local first_indent_detected=0
 
@@ -146,7 +144,6 @@ check_indentation() {
                 errors+=("  Содержимое: ${line}")
             fi
         fi
-        prev_indent=$current_indent
     done < "$file"
 
     if [[ ${#errors[@]} -gt 0 ]]; then
@@ -192,8 +189,10 @@ check_basic_syntax() {
             fi
         fi
 
-        local single_quotes=$(echo "$line" | grep -o "'" | wc -l)
-        local double_quotes=$(echo "$line" | grep -o '"' | wc -l)
+        local single_quotes
+        local double_quotes
+        single_quotes=$(echo "$line" | grep -o "'" | wc -l)
+        double_quotes=$(echo "$line" | grep -o '"' | wc -l)
 
         if [[ $((single_quotes % 2)) -ne 0 ]]; then
             errors+=("Строка $line_num: Непарные одинарные кавычки")
@@ -276,8 +275,7 @@ validate_yaml_file() {
         echo -e "  ${CYAN}├─ Проверка кодировки Windows (CRLF)...${NC}"
     fi
     local encoding_errors
-    encoding_errors=$(check_windows_encoding "$file")
-    if [[ $? -ne 0 ]]; then
+    if ! encoding_errors=$(check_windows_encoding "$file"); then
         file_errors+=("=== ОШИБКИ КОДИРОВКИ ===")
         file_errors+=("$encoding_errors")
     fi
@@ -286,8 +284,7 @@ validate_yaml_file() {
         echo -e "  ${CYAN}├─ Проверка табов...${NC}"
     fi
     local tab_errors
-    tab_errors=$(check_tabs "$file")
-    if [[ $? -ne 0 ]]; then
+    if ! tab_errors=$(check_tabs "$file"); then
         file_errors+=("=== ОШИБКИ ТАБОВ ===")
         file_errors+=("$tab_errors")
     fi
@@ -296,8 +293,7 @@ validate_yaml_file() {
         echo -e "  ${CYAN}├─ Проверка пробелов в конце строк...${NC}"
     fi
     local trailing_errors
-    trailing_errors=$(check_trailing_whitespace "$file")
-    if [[ $? -ne 0 ]]; then
+    if ! trailing_errors=$(check_trailing_whitespace "$file"); then
         file_errors+=("=== ПРЕДУПРЕЖДЕНИЯ: TRAILING WHITESPACE ===")
         file_errors+=("$trailing_errors")
     fi
@@ -306,8 +302,7 @@ validate_yaml_file() {
         echo -e "  ${CYAN}├─ Проверка отступов...${NC}"
     fi
     local indent_errors
-    indent_errors=$(check_indentation "$file")
-    if [[ $? -ne 0 ]]; then
+    if ! indent_errors=$(check_indentation "$file"); then
         file_errors+=("=== ОШИБКИ ОТСТУПОВ ===")
         file_errors+=("$indent_errors")
     fi
@@ -316,8 +311,7 @@ validate_yaml_file() {
         echo -e "  ${CYAN}├─ Проверка синтаксиса...${NC}"
     fi
     local syntax_errors
-    syntax_errors=$(check_basic_syntax "$file")
-    if [[ $? -ne 0 ]]; then
+    if ! syntax_errors=$(check_basic_syntax "$file"); then
         file_errors+=("=== ОШИБКИ СИНТАКСИСА ===")
         file_errors+=("$syntax_errors")
     fi
@@ -326,8 +320,7 @@ validate_yaml_file() {
         echo -e "  ${CYAN}└─ Проверка Kubernetes полей...${NC}"
     fi
     local k8s_errors
-    k8s_errors=$(check_kubernetes_specific "$file")
-    if [[ $? -ne 0 ]]; then
+    if ! k8s_errors=$(check_kubernetes_specific "$file"); then
         file_errors+=("=== KUBERNETES ПРЕДУПРЕЖДЕНИЯ ===")
         file_errors+=("$k8s_errors")
     fi
@@ -393,7 +386,7 @@ generate_report() {
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
             echo ""
             echo "1. WINDOWS ENCODING (CRLF -> LF):"
-            echo "   Команда: sed -i 's/\r$//' <файл>"
+            printf "   Команда: sed -i 's/\\r\$//' <файл>\n"
             echo ""
             echo "2. ТАБЫ -> ПРОБЕЛЫ:"
             echo "   Команда: expand -t 2 <файл> > <файл>.tmp && mv <файл>.tmp <файл>"
@@ -440,7 +433,6 @@ main() {
     fi
 
     TARGET_DIR="$target_dir"
-    REPORT_FILE="$output_file"
 
     print_header
     echo -e "${BOLD}Начинаю валидацию YAML файлов...${NC}"

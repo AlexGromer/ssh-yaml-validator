@@ -68,7 +68,6 @@ fix_file() {
     local file="$1"
     local backup="$2"
     local dry_run="$3"
-    local fixed=0
 
     echo -e "${CYAN}[ОБРАБОТКА]${NC} $file"
 
@@ -105,20 +104,17 @@ fix_file() {
                 sed 's/\r$//' "$file" > "$temp_file"
                 mv "$temp_file" "$file"
                 echo -e "  ${GREEN}├─ [✓] CRLF -> LF${NC}"
-                fixed=1
             fi
 
             if [[ $has_tabs -eq 1 ]]; then
                 expand -t 2 "$file" > "$temp_file"
                 mv "$temp_file" "$file"
                 echo -e "  ${GREEN}├─ [✓] Табы -> Пробелы${NC}"
-                fixed=1
             fi
 
             if [[ $has_trailing -eq 1 ]]; then
                 sed -i 's/[[:space:]]*$//' "$file"
                 echo -e "  ${GREEN}├─ [✓] Удалены trailing whitespace${NC}"
-                fixed=1
             fi
 
             echo -e "  ${GREEN}└─ [УСПЕХ] Файл исправлен${NC}"
