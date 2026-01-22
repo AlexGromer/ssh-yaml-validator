@@ -33,7 +33,7 @@ ERRORS_FOUND=()
 print_header() {
     echo -e "${BOLD}${CYAN}"
     echo "╔═══════════════════════════════════════════════════════════════════════╗"
-    echo "║                    YAML Validator v1.0.0                              ║"
+    echo "║                    YAML Validator v2.0.0                              ║"
     echo "║              Pure Bash Implementation for Air-Gapped Env              ║"
     echo "╚═══════════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
@@ -159,12 +159,37 @@ check_basic_syntax() {
     local file="$1"
     local line_num=0
     local errors=()
+    local in_multiline=0
+    local multiline_indent=0
 
     while IFS= read -r line || [[ -n "$line" ]]; do
         ((line_num++))
         [[ -z "$line" ]] && continue
         local trimmed_line="${line%%[[:space:]]}"
         [[ "$trimmed_line" =~ ^[[:space:]]*# ]] && continue
+
+        # Detect multiline block start: "key: |" or "key: >"
+        if [[ "$line" =~ ^([[:space:]]*)([^:]+):[[:space:]]*[\|\>]([[:space:]]*|[[:space:]]+.*)$ ]]; then
+            in_multiline=1
+            multiline_indent=${#BASH_REMATCH[1]}
+            continue
+        fi
+
+        # Inside multiline: skip validation until indent returns to base level
+        if [[ $in_multiline -eq 1 ]]; then
+            local current_indent=0
+            if [[ "$line" =~ ^([[:space:]]*) ]]; then
+                current_indent=${#BASH_REMATCH[1]}
+            fi
+
+            # Check if we have a non-empty line at or before multiline indent level
+            if [[ "$line" =~ ^[[:space:]]*[^[:space:]] ]] && [[ $current_indent -le $multiline_indent ]]; then
+                in_multiline=0
+                # Don't skip this line, process it as normal YAML
+            else
+                continue  # Skip validation for multiline content
+            fi
+        fi
 
         local single_quotes=$(echo "$line" | grep -o "'" | wc -l)
         local double_quotes=$(echo "$line" | grep -o '"' | wc -l)

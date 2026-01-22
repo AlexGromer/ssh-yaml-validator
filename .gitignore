@@ -17,5 +17,5 @@ Thumbs.db
 *.swp
 *.swo
 
-# Claude settings
-.claude/settings.local.json
+# Claude settings (exclude entire directory)
+.claude/
