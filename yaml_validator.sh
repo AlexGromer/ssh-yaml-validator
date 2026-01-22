@@ -41,16 +41,17 @@ print_header() {
 
 usage() {
     cat << EOF
-Использование: $0 [ОПЦИИ] <директория>
+Использование: $0 [ОПЦИИ] <файл_или_директория>
 
 Опции:
     -o, --output FILE       Сохранить отчёт в файл (по умолчанию: yaml_validation_report.txt)
-    -r, --recursive         Рекурсивный поиск YAML файлов
+    -r, --recursive         Рекурсивный поиск YAML файлов (только для директорий)
     -v, --verbose           Подробный вывод
     -h, --help              Показать эту справку
 
 Примеры:
     $0 /path/to/manifests
+    $0 config.yaml
     $0 -r -o report.txt /path/to/manifests
     $0 --recursive --verbose /home/user/k8s/
 
@@ -429,12 +430,12 @@ main() {
     done
 
     if [[ -z "$target_dir" ]]; then
-        echo -e "${RED}Ошибка: Не указана директория для проверки${NC}"
+        echo -e "${RED}Ошибка: Не указан файл или директория для проверки${NC}"
         usage
     fi
 
-    if [[ ! -d "$target_dir" ]]; then
-        echo -e "${RED}Ошибка: Директория не существует: $target_dir${NC}"
+    if [[ ! -e "$target_dir" ]]; then
+        echo -e "${RED}Ошибка: Файл или директория не существует: $target_dir${NC}"
         exit 1
     fi
 
@@ -443,12 +444,18 @@ main() {
 
     print_header
     echo -e "${BOLD}Начинаю валидацию YAML файлов...${NC}"
-    echo -e "Директория: ${CYAN}$target_dir${NC}"
-    echo -e "Режим: ${CYAN}$([ $recursive -eq 1 ] && echo "Рекурсивный" || echo "Только текущая директория")${NC}"
-    echo ""
 
-    echo -e "${YELLOW}[ПОИСК]${NC} Сканирование файлов..."
-    mapfile -t yaml_files < <(find_yaml_files "$target_dir" "$recursive")
+    # Handle both files and directories
+    if [[ -f "$target_dir" ]]; then
+        echo -e "Файл: ${CYAN}$target_dir${NC}"
+        yaml_files=("$target_dir")
+    else
+        echo -e "Директория: ${CYAN}$target_dir${NC}"
+        echo -e "Режим: ${CYAN}$([ $recursive -eq 1 ] && echo "Рекурсивный" || echo "Только текущая директория")${NC}"
+        echo ""
+        echo -e "${YELLOW}[ПОИСК]${NC} Сканирование файлов..."
+        mapfile -t yaml_files < <(find_yaml_files "$target_dir" "$recursive")
+    fi
     TOTAL_FILES=${#yaml_files[@]}
 
     if [[ $TOTAL_FILES -eq 0 ]]; then
