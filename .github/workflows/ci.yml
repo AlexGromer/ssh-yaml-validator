@@ -6,7 +6,7 @@ on:
     paths:
       - '**.sh'
       - 'test_samples/**'
-      - '.github/workflows/**'
+      - '.github/**'
   push:
     branches: [ main ]
 
