@@ -17,10 +17,10 @@
 
 ### 2. Status Checks
 - ✅ **Branches must be up to date**: Да
-- ✅ **Required checks**:
-  1. `validate / Validate YAML Files`
-  2. `shellcheck / ShellCheck Linting`
-  3. `security / Security Scan`
+- ✅ **Required checks** (GitHub Actions):
+  1. `Validate YAML Files`
+  2. `ShellCheck Linting`
+  3. `Security Scan`
 
 ### 3. Commit Requirements
 - ✅ **GPG signatures required**: Да (все коммиты)
@@ -76,9 +76,9 @@ gh pr create --title "feat: add new feature" --body "Description"
 ```
 
 ### Шаг 3: Дождаться CI
-- ✅ validate / Validate YAML Files
-- ✅ shellcheck / ShellCheck Linting
-- ✅ security / Security Scan
+- ✅ Validate YAML Files
+- ✅ ShellCheck Linting
+- ✅ Security Scan
 
 ### Шаг 4: Merge (после успешного CI)
 ```bash
@@ -109,6 +109,7 @@ gh pr merge --squash --delete-branch
 | 2026-01-22 12:30 | Применена branch protection через GitHub API (с required approvals) | ✅ |
 | 2026-01-22 12:45 | Протестирована защита (попытка push) | ✅ BLOCKED |
 | 2026-01-22 19:30 | Обновлена защита: удален required approvals (solo development) | ✅ |
+| 2026-01-22 20:00 | Исправлены имена required checks (без префиксов job/) | ✅ |
 
 ---
 
