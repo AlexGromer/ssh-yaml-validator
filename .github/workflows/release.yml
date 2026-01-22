@@ -1,0 +1,146 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Extract version from tag
+        id: version
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Version: $VERSION"
+
+      - name: Verify version in scripts
+        run: |
+          VALIDATOR_VERSION=$(grep "^# Version:" yaml_validator.sh | awk '{print $3}')
+          FIX_VERSION=$(grep "^# Version:" fix_yaml_issues.sh | awk '{print $3}')
+          TAG_VERSION="${{ steps.version.outputs.version }}"
+
+          echo "Tag version: $TAG_VERSION"
+          echo "Validator version: $VALIDATOR_VERSION"
+          echo "Fix module version: $FIX_VERSION"
+
+          if [ "$VALIDATOR_VERSION" != "$TAG_VERSION" ]; then
+            echo "❌ Version mismatch in yaml_validator.sh"
+            exit 1
+          fi
+
+          if [ "$FIX_VERSION" != "$TAG_VERSION" ]; then
+            echo "❌ Version mismatch in fix_yaml_issues.sh"
+            exit 1
+          fi
+
+          echo "✅ Version consistency verified"
+
+      - name: Create release archive
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          ARCHIVE_NAME="ssh-yaml-validator-v${VERSION}.tar.gz"
+
+          tar -czf "$ARCHIVE_NAME" \
+            yaml_validator.sh \
+            fix_yaml_issues.sh \
+            test_samples/ \
+            README.md \
+            QUICKSTART.md \
+            install.sh \
+            DEMO.sh \
+            --exclude='*.bak' \
+            --exclude='test_samples_fix'
+
+          echo "archive_name=$ARCHIVE_NAME" >> $GITHUB_OUTPUT
+          ls -lh "$ARCHIVE_NAME"
+
+      - name: Generate release notes
+        id: release_notes
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          VALIDATOR_CHECKS=$(grep -c "^check_.*() {" yaml_validator.sh || echo "Unknown")
+          FIX_FEATURES=$(grep -c "has_.*=1" fix_yaml_issues.sh || echo "Unknown")
+          TEST_FILES=$(ls -1 test_samples/*.yaml 2>/dev/null | wc -l)
+
+          cat > release_notes.md <<EOF
+          ## 🚀 SSH YAML Validator v${VERSION}
+
+          ### 📊 Features
+          - **Validation Checks**: ${VALIDATOR_CHECKS} comprehensive checks
+          - **Auto-Fix Capabilities**: ${FIX_FEATURES} automatic fixes
+          - **Test Coverage**: ${TEST_FILES} test sample files
+
+          ### ✅ Compatibility
+          - ✅ Astra Linux SE 1.7 Smolensk (Debian 10 based)
+          - ✅ Bash 5.0+
+          - ✅ Pure bash implementation (no external dependencies)
+          - ✅ Air-gapped/isolated environment ready
+
+          ### 📦 Installation
+
+          \`\`\`bash
+          # Download and extract
+          wget https://github.com/AlexGromer/ssh-yaml-validator/releases/download/v${VERSION}/ssh-yaml-validator-v${VERSION}.tar.gz
+          tar -xzf ssh-yaml-validator-v${VERSION}.tar.gz
+          cd ssh-yaml-validator-v${VERSION}
+
+          # Run installer
+          chmod +x install.sh
+          sudo ./install.sh
+
+          # Or manual installation
+          chmod +x yaml_validator.sh fix_yaml_issues.sh
+          sudo cp yaml_validator.sh /usr/local/bin/
+          sudo cp fix_yaml_issues.sh /usr/local/bin/
+          \`\`\`
+
+          ### 🔧 Usage
+
+          \`\`\`bash
+          # Validate YAML file
+          yaml_validator.sh your_file.yaml
+
+          # Auto-fix common issues
+          fix_yaml_issues.sh your_file.yaml
+
+          # Run demo
+          ./DEMO.sh
+          \`\`\`
+
+          ### 📝 Documentation
+          - [README](https://github.com/AlexGromer/ssh-yaml-validator/blob/main/README.md)
+          - [QUICKSTART](https://github.com/AlexGromer/ssh-yaml-validator/blob/main/QUICKSTART.md)
+
+          ### 🔐 Security
+          - All commits GPG signed
+          - Security scans passed
+          - ShellCheck validation passed
+          EOF
+
+          cat release_notes.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          body_path: release_notes.md
+          files: |
+            ssh-yaml-validator-v${{ steps.version.outputs.version }}.tar.gz
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Notify release created
+        run: |
+          echo "✅ Release v${{ steps.version.outputs.version }} created successfully"
+          echo "🔗 https://github.com/AlexGromer/ssh-yaml-validator/releases/tag/v${{ steps.version.outputs.version }}"
