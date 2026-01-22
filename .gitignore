@@ -1,0 +1,18 @@
+# Reports
+yaml_validation_report.txt
+*.bak
+
+# Temp files
+*.tmp
+*.tmp.*
+test_demo/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo

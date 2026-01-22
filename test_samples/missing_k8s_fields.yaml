@@ -1,0 +1,6 @@
+metadata:
+  name: incomplete-manifest
+spec:
+  containers:
+  - name: app
+    image: alpine:latest
