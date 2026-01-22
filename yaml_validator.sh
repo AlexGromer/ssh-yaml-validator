@@ -5,7 +5,7 @@
 # Pure bash implementation for Astra Linux SE 1.7 (Smolensk)
 # Purpose: Validate YAML files in Kubernetes clusters without external tools
 # Author: Generated for isolated environments
-# Version: 1.0.0
+# Version: 2.0.0
 #############################################################################
 
 set -o pipefail
