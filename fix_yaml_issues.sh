@@ -35,10 +35,10 @@ print_header() {
 
 usage() {
     cat << EOF
-Использование: $0 [ОПЦИИ] <директория>
+Использование: $0 [ОПЦИИ] <файл_или_директория>
 
 Опции:
-    -r, --recursive         Рекурсивная обработка поддиректорий
+    -r, --recursive         Рекурсивная обработка поддиректорий (только для директорий)
     -b, --backup            Создать резервные копии (*.yaml.bak)
     -n, --dry-run           Только показать, что будет сделано (не изменять файлы)
     -h, --help              Показать эту справку
@@ -50,6 +50,7 @@ usage() {
 
 Примеры:
     $0 /path/to/manifests
+    $0 config.yaml
     $0 -r -b /path/to/manifests
     $0 --dry-run /path/to/manifests
 
@@ -67,7 +68,6 @@ fix_file() {
     local file="$1"
     local backup="$2"
     local dry_run="$3"
-    local fixed=0
 
     echo -e "${CYAN}[ОБРАБОТКА]${NC} $file"
 
@@ -104,20 +104,17 @@ fix_file() {
                 sed 's/\r$//' "$file" > "$temp_file"
                 mv "$temp_file" "$file"
                 echo -e "  ${GREEN}├─ [✓] CRLF -> LF${NC}"
-                fixed=1
             fi
 
             if [[ $has_tabs -eq 1 ]]; then
                 expand -t 2 "$file" > "$temp_file"
                 mv "$temp_file" "$file"
                 echo -e "  ${GREEN}├─ [✓] Табы -> Пробелы${NC}"
-                fixed=1
             fi
 
             if [[ $has_trailing -eq 1 ]]; then
                 sed -i 's/[[:space:]]*$//' "$file"
                 echo -e "  ${GREEN}├─ [✓] Удалены trailing whitespace${NC}"
-                fixed=1
             fi
 
             echo -e "  ${GREEN}└─ [УСПЕХ] Файл исправлен${NC}"
@@ -179,12 +176,12 @@ main() {
     done
 
     if [[ -z "$target_dir" ]]; then
-        echo -e "${RED}Ошибка: Не указана директория${NC}"
+        echo -e "${RED}Ошибка: Не указан файл или директория${NC}"
         usage
     fi
 
-    if [[ ! -d "$target_dir" ]]; then
-        echo -e "${RED}Ошибка: Директория не существует: $target_dir${NC}"
+    if [[ ! -e "$target_dir" ]]; then
+        echo -e "${RED}Ошибка: Файл или директория не существует: $target_dir${NC}"
         exit 1
     fi
 
@@ -196,12 +193,22 @@ main() {
     fi
 
     echo -e "${BOLD}Начинаю обработку YAML файлов...${NC}"
-    echo -e "Директория: ${CYAN}$target_dir${NC}"
-    echo -e "Режим: ${CYAN}$([ $recursive -eq 1 ] && echo "Рекурсивный" || echo "Только текущая директория")${NC}"
-    echo -e "Backup: ${CYAN}$([ $backup -eq 1 ] && echo "Да" || echo "Нет")${NC}"
-    echo ""
 
-    find_and_fix_files "$target_dir" "$recursive" "$backup" "$dry_run"
+    # Handle both files and directories
+    if [[ -f "$target_dir" ]]; then
+        echo -e "Файл: ${CYAN}$target_dir${NC}"
+        echo -e "Backup: ${CYAN}$([ $backup -eq 1 ] && echo "Да" || echo "Нет")${NC}"
+        echo ""
+
+        fix_file "$target_dir" "$backup" "$dry_run"
+    else
+        echo -e "Директория: ${CYAN}$target_dir${NC}"
+        echo -e "Режим: ${CYAN}$([ $recursive -eq 1 ] && echo "Рекурсивный" || echo "Только текущая директория")${NC}"
+        echo -e "Backup: ${CYAN}$([ $backup -eq 1 ] && echo "Да" || echo "Нет")${NC}"
+        echo ""
+
+        find_and_fix_files "$target_dir" "$recursive" "$backup" "$dry_run"
+    fi
 
     echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo -e "${BOLD}ИТОГИ${NC}"

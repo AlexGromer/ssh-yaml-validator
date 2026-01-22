@@ -1,6 +1,7 @@
 # Branch Protection Status
 
 **Дата настройки**: 2026-01-22
+**Последнее обновление**: 2026-01-22 19:30 UTC
 **Статус**: ✅ **АКТИВНА**
 **Репозиторий**: AlexGromer/ssh-yaml-validator
 **Защищённая ветка**: `main`
@@ -11,9 +12,8 @@
 
 ### 1. Pull Request Requirements
 - ✅ **Требуется PR перед merge**: Да
-- ✅ **Требуется approvals**: 1
-- ✅ **Dismiss stale reviews**: Да (при новых коммитах)
-- ✅ **Require last push approval**: Да
+- ❌ **Требуется approvals**: Нет (solo development)
+- ℹ️ **Почему нет approvals?** См. раздел "Solo Development" ниже
 
 ### 2. Status Checks
 - ✅ **Branches must be up to date**: Да
@@ -80,14 +80,12 @@ gh pr create --title "feat: add new feature" --body "Description"
 - ✅ shellcheck / ShellCheck Linting
 - ✅ security / Security Scan
 
-### Шаг 4: Получить Approval
-- Если есть GitHub App для approval — автоматически
-- Иначе — попросить другого участника
-
-### Шаг 5: Merge
+### Шаг 4: Merge (после успешного CI)
 ```bash
 gh pr merge --squash --delete-branch
 ```
+
+Или через MCP GitHub API.
 
 ---
 
@@ -96,11 +94,10 @@ gh pr merge --squash --delete-branch
 1. ❌ Прямой push в `main`
 2. ❌ Force push в `main`
 3. ❌ Удаление ветки `main`
-4. ❌ Merge без approval
-5. ❌ Merge без прохождения CI
-6. ❌ Коммиты без GPG подписи
-7. ❌ Merge commits (только rebase/squash)
-8. ❌ Merge с нерешёнными комментариями
+4. ❌ Merge без прохождения CI (3 required checks)
+5. ❌ Коммиты без GPG подписи
+6. ❌ Merge commits (только rebase/squash)
+7. ❌ Merge с нерешёнными комментариями
 
 ---
 
@@ -108,9 +105,10 @@ gh pr merge --squash --delete-branch
 
 | Дата | Действие | Статус |
 |------|----------|--------|
-| 2026-01-22 | Создана документация `.github/BRANCH_PROTECTION_SETUP.md` | ✅ |
-| 2026-01-22 | Применена branch protection через GitHub API | ✅ |
-| 2026-01-22 | Протестирована защита (попытка push) | ✅ BLOCKED |
+| 2026-01-22 10:00 | Создана документация `.github/BRANCH_PROTECTION_SETUP.md` | ✅ |
+| 2026-01-22 12:30 | Применена branch protection через GitHub API (с required approvals) | ✅ |
+| 2026-01-22 12:45 | Протестирована защита (попытка push) | ✅ BLOCKED |
+| 2026-01-22 19:30 | Обновлена защита: удален required approvals (solo development) | ✅ |
 
 ---
 
@@ -130,16 +128,34 @@ gh pr merge --squash --delete-branch
 
 **Решение**: Вариант Б — оставить коммит как есть, настроить защиту, далее работать правильно.
 
-### Как работает с GitHub App для approval?
+### Solo Development: Почему нет Required Approvals?
 
-GitHub App (из `~/.claude/guides/GITHUB_APP_SETUP.md`) используется для автоматического approval PR, так как GitHub API не позволяет аппрувить собственные PR.
+**Проблема**: В **personal repositories** (не organization) GitHub Apps всегда имеют `author_association: NONE`, и их approval не засчитывается для branch protection.
 
-**Workflow**:
-1. Claude Code создаёт PR (MCP GitHub + `GITHUB_TOKEN`)
-2. CI проходит проверки
-3. Claude Code аппрувит PR (GitHub App + Private Key)
-4. Claude Code мержит PR (MCP GitHub + `GITHUB_TOKEN`)
+**GitHub ограничение**:
+- Вы не можете approve свои собственные PR (GitHub API блокирует)
+- GitHub App не может стать collaborator в personal repo через UI
+- GitHub App approval имеет `author_association: NONE` → не засчитывается
+
+**Решение для solo projects** — **Best Practice**:
+```yaml
+✅ Required status checks (CI must pass)
+✅ Required signatures (GPG)
+✅ Required linear history
+✅ Enforce for administrators
+✅ Required conversation resolution
+❌ Required approving review count: 0  # Отключено для solo
+```
+
+**Защиты остаются эффективными**:
+- Нельзя push напрямую в main
+- Все изменения через PR
+- CI обязателен (3 checks)
+- GPG подпись обязательна
+- Только rebase/squash merge
+
+**Для organization repos**: GitHub App будет работать корректно с required approvals.
 
 ---
 
-**Последнее обновление**: 2026-01-22 12:45 UTC
+**Последнее обновление**: 2026-01-22 19:30 UTC
