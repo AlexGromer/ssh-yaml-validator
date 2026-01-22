@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: empty-keys-test
+data:
+  : no-key-here
+  "  ": spaces-only-key
+  valid-key: valid-value

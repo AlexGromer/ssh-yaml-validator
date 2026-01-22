@@ -1,0 +1,13 @@
+Apiversion: v1
+Kind: Pod
+Metadata:
+  name: typo-test
+Spec:
+  containers:
+  - name: app
+    image: nginx:latest
+    imagepullpolicy: Always
+    ports:
+    - container_port: 80
+      protocol: TCP
+  restartpolicy: Always

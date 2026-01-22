@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: Pod
+Metadata:
+  name: complex-test
+  labels:
+    app: test
+    app: duplicate
+spec:
+  containers:
+  -name: nginx
+    image: nginx:latest
+    tty: True
+    stdin: FALSE
+    ports:
+    -containerPort: 80
+    env:
+    -name: VAR1
+      value: yes
+  restartpolicy: Always

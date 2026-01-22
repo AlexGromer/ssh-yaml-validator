@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: special-test
+data:
+  array_unclosed: [1, 2, 3
+  object_unclosed: {key: value
+  yes_value: yes
+  no_value: no
+  on_value: on
+  off_value: off
+  null_upper: NULL
+  null_title: Null
+  tilde_null: ~

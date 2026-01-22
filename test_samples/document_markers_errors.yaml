@@ -1,0 +1,14 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: marker-test1
+data:
+  key: value
+----
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: marker-test2
+data:
+  key: value2

@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(printf:*)",
+      "Bash(./yaml_validator.sh:*)",
+      "Bash(./fix_yaml_issues.sh:*)",
+      "Bash(tree:*)",
+      "Bash(env)",
+      "Bash(claude mcp list:*)",
+      "Bash(claude mcp:*)",
+      "Bash(export GITHUB_PERSONAL_ACCESS_TOKEN:*)",
+      "Bash(source ~/.zshrc)",
+      "Bash(npx -y @modelcontextprotocol/server-github --help)",
+      "Bash(curl:*)",
+      "mcp__github__search_repositories",
+      "Bash(bash:*)",
+      "mcp__github__create_repository",
+      "mcp__github__push_files",
+      "mcp__github__create_or_update_file",
+      "mcp__github__get_file_contents"
+    ]
+  }
+}

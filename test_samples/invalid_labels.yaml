@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: invalid-labels-test
+  labels:
+    valid-label: value
+    -starts-with-dash: bad
+    ends-with-dash-: bad
+    has spaces: bad
+    way-too-long-label-name-that-exceeds-the-maximum-allowed-length-of-63-characters: bad
+    has@special#chars: bad
+spec:
+  containers:
+  - name: nginx
+    image: nginx:latest

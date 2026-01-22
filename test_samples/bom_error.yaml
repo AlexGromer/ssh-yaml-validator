@@ -1,0 +1,8 @@
+﻿apiVersion: v1
+kind: Pod
+metadata:
+  name: bom-test
+spec:
+  containers:
+  - name: nginx
+    image: nginx:latest

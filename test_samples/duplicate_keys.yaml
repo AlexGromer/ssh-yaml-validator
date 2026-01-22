@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: test-config
+  name: duplicate-name
+data:
+  key1: value1
+  key2: value2
+  key1: value3
+  setting: enabled
+  setting: disabled
