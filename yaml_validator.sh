@@ -5,7 +5,7 @@
 # Pure bash implementation for Astra Linux SE 1.7 (Smolensk)
 # Purpose: Validate YAML files in Kubernetes clusters without external tools
 # Author: Generated for isolated environments
-# Version: 2.3.0
+# Version: 2.4.0
 #############################################################################
 
 set -o pipefail
@@ -32,7 +32,7 @@ ERRORS_FOUND=()
 print_header() {
     echo -e "${BOLD}${CYAN}"
     echo "╔═══════════════════════════════════════════════════════════════════════╗"
-    echo "║                    YAML Validator v2.3.0                              ║"
+    echo "║                    YAML Validator v2.4.0                              ║"
     echo "║              Pure Bash Implementation for Air-Gapped Env              ║"
     echo "╚═══════════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
@@ -2231,6 +2231,1187 @@ check_kubernetes_specific() {
     return 0
 }
 
+# ============================================================================
+# NEW CHECKS v2.4.0 - Maximum coverage edge case validation
+# ============================================================================
+
+check_deprecated_api() {
+    local file="$1"
+    local line_num=0
+    local warnings=()
+
+    # Deprecated API versions database (Kubernetes 1.22+)
+    declare -A deprecated_apis=(
+        # Removed in 1.16
+        ["extensions/v1beta1:Deployment"]="apps/v1"
+        ["extensions/v1beta1:DaemonSet"]="apps/v1"
+        ["extensions/v1beta1:ReplicaSet"]="apps/v1"
+        ["extensions/v1beta1:StatefulSet"]="apps/v1"
+        ["extensions/v1beta1:NetworkPolicy"]="networking.k8s.io/v1"
+        ["extensions/v1beta1:PodSecurityPolicy"]="policy/v1beta1 (deprecated)"
+        ["apps/v1beta1:Deployment"]="apps/v1"
+        ["apps/v1beta2:Deployment"]="apps/v1"
+        # Removed in 1.22
+        ["extensions/v1beta1:Ingress"]="networking.k8s.io/v1"
+        ["networking.k8s.io/v1beta1:Ingress"]="networking.k8s.io/v1"
+        ["networking.k8s.io/v1beta1:IngressClass"]="networking.k8s.io/v1"
+        ["rbac.authorization.k8s.io/v1beta1:ClusterRole"]="rbac.authorization.k8s.io/v1"
+        ["rbac.authorization.k8s.io/v1beta1:ClusterRoleBinding"]="rbac.authorization.k8s.io/v1"
+        ["rbac.authorization.k8s.io/v1beta1:Role"]="rbac.authorization.k8s.io/v1"
+        ["rbac.authorization.k8s.io/v1beta1:RoleBinding"]="rbac.authorization.k8s.io/v1"
+        ["admissionregistration.k8s.io/v1beta1:MutatingWebhookConfiguration"]="admissionregistration.k8s.io/v1"
+        ["admissionregistration.k8s.io/v1beta1:ValidatingWebhookConfiguration"]="admissionregistration.k8s.io/v1"
+        ["apiextensions.k8s.io/v1beta1:CustomResourceDefinition"]="apiextensions.k8s.io/v1"
+        ["certificates.k8s.io/v1beta1:CertificateSigningRequest"]="certificates.k8s.io/v1"
+        ["coordination.k8s.io/v1beta1:Lease"]="coordination.k8s.io/v1"
+        ["storage.k8s.io/v1beta1:CSIDriver"]="storage.k8s.io/v1"
+        ["storage.k8s.io/v1beta1:CSINode"]="storage.k8s.io/v1"
+        ["storage.k8s.io/v1beta1:StorageClass"]="storage.k8s.io/v1"
+        ["storage.k8s.io/v1beta1:VolumeAttachment"]="storage.k8s.io/v1"
+        # Removed in 1.25
+        ["batch/v1beta1:CronJob"]="batch/v1"
+        ["discovery.k8s.io/v1beta1:EndpointSlice"]="discovery.k8s.io/v1"
+        ["events.k8s.io/v1beta1:Event"]="events.k8s.io/v1"
+        ["autoscaling/v2beta1:HorizontalPodAutoscaler"]="autoscaling/v2"
+        ["policy/v1beta1:PodDisruptionBudget"]="policy/v1"
+        ["policy/v1beta1:PodSecurityPolicy"]="REMOVED (use Pod Security Admission)"
+        ["node.k8s.io/v1beta1:RuntimeClass"]="node.k8s.io/v1"
+        # Removed in 1.26
+        ["autoscaling/v2beta2:HorizontalPodAutoscaler"]="autoscaling/v2"
+        ["flowcontrol.apiserver.k8s.io/v1beta1:FlowSchema"]="flowcontrol.apiserver.k8s.io/v1beta3"
+        ["flowcontrol.apiserver.k8s.io/v1beta1:PriorityLevelConfiguration"]="flowcontrol.apiserver.k8s.io/v1beta3"
+    )
+
+    local current_api=""
+    local current_kind=""
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Detect apiVersion
+        if [[ "$line" =~ ^apiVersion:[[:space:]]+([^[:space:]#]+) ]]; then
+            current_api="${BASH_REMATCH[1]}"
+        fi
+
+        # Detect kind
+        if [[ "$line" =~ ^kind:[[:space:]]+([^[:space:]#]+) ]]; then
+            current_kind="${BASH_REMATCH[1]}"
+
+            # Check for deprecated combination
+            local key="${current_api}:${current_kind}"
+            if [[ -n "${deprecated_apis[$key]}" ]]; then
+                warnings+=("Строка $line_num: УСТАРЕВШИЙ API: $current_api/$current_kind")
+                warnings+=("  Рекомендация: Используйте ${deprecated_apis[$key]}")
+                warnings+=("  Документация: https://kubernetes.io/docs/reference/using-api/deprecation-guide/")
+            fi
+        fi
+
+        # Reset on document separator
+        if [[ "$line" =~ ^---[[:space:]]*$ ]]; then
+            current_api=""
+            current_kind=""
+        fi
+    done < "$file"
+
+    if [[ ${#warnings[@]} -gt 0 ]]; then
+        printf '%s\n' "${warnings[@]}"
+    fi
+    return 0
+}
+
+check_selector_match() {
+    local file="$1"
+    local errors=()
+
+    # Kinds that require selector/template matching
+    local selector_kinds="Deployment|DaemonSet|StatefulSet|ReplicaSet|Job"
+
+    # Read file into array for multi-pass processing
+    local -a lines
+    mapfile -t lines < "$file"
+    local total_lines=${#lines[@]}
+
+    local detected_kind=""
+    local selector_labels=""
+    local template_labels=""
+    local in_selector=0
+    local in_template=0
+    local in_template_metadata=0
+    local in_template_labels=0
+    local indent_selector=0
+    local indent_template_labels=0
+
+    for ((i=0; i<total_lines; i++)); do
+        local line="${lines[$i]}"
+        local line_num=$((i + 1))
+
+        # Skip comments
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+
+        # Get current indent
+        local indent=0
+        if [[ "$line" =~ ^([[:space:]]*) ]]; then
+            indent=${#BASH_REMATCH[1]}
+        fi
+
+        # Detect kind
+        if [[ "$line" =~ ^kind:[[:space:]]+($selector_kinds) ]]; then
+            detected_kind="${BASH_REMATCH[1]}"
+        fi
+
+        # Reset on document separator
+        if [[ "$line" =~ ^---[[:space:]]*$ ]] || [[ "$line" == "---" ]]; then
+            # Check match
+            if [[ -n "$detected_kind" ]] && [[ -n "$selector_labels" ]] && [[ -n "$template_labels" ]]; then
+                # Sort labels for comparison
+                local sorted_selector
+                local sorted_template
+                sorted_selector=$(echo "$selector_labels" | tr ';' '\n' | sort | tr '\n' ';')
+                sorted_template=$(echo "$template_labels" | tr ';' '\n' | sort | tr '\n' ';')
+
+                if [[ "$sorted_selector" != "$sorted_template" ]]; then
+                    errors+=("ОШИБКА: selector.matchLabels не соответствует template.metadata.labels")
+                    errors+=("  selector: ${selector_labels%;}")
+                    errors+=("  template: ${template_labels%;}")
+                    errors+=("  Это приведёт к ошибке при применении манифеста")
+                fi
+            fi
+            detected_kind=""
+            selector_labels=""
+            template_labels=""
+            in_selector=0
+            in_template=0
+            in_template_metadata=0
+            in_template_labels=0
+            continue
+        fi
+
+        # Detect spec.selector.matchLabels
+        if [[ "$line" =~ ^([[:space:]]*)matchLabels:[[:space:]]*$ ]]; then
+            in_selector=1
+            indent_selector=${#BASH_REMATCH[1]}
+            continue
+        fi
+
+        # Collect selector labels
+        if [[ $in_selector -eq 1 ]]; then
+            if ((indent <= indent_selector)); then
+                in_selector=0
+            elif [[ "$line" =~ ^[[:space:]]+([a-zA-Z0-9._/-]+):[[:space:]]+([^#]+) ]]; then
+                local key="${BASH_REMATCH[1]}"
+                local val="${BASH_REMATCH[2]}"
+                val="${val%"${val##*[![:space:]]}"}"  # trim trailing spaces
+                selector_labels+="${key}=${val};"
+            fi
+        fi
+
+        # Detect template section (spec.template)
+        if [[ "$line" =~ ^[[:space:]]+template:[[:space:]]*$ ]]; then
+            in_template=1
+            in_template_metadata=0
+            in_template_labels=0
+            continue
+        fi
+
+        # Detect metadata under template
+        if [[ $in_template -eq 1 ]] && [[ "$line" =~ ^[[:space:]]+metadata:[[:space:]]*$ ]]; then
+            in_template_metadata=1
+            continue
+        fi
+
+        # Detect labels under template.metadata
+        if [[ $in_template_metadata -eq 1 ]] && [[ "$line" =~ ^([[:space:]]*)labels:[[:space:]]*$ ]]; then
+            in_template_labels=1
+            indent_template_labels=${#BASH_REMATCH[1]}
+            continue
+        fi
+
+        # Collect template labels
+        if [[ $in_template_labels -eq 1 ]]; then
+            if ((indent <= indent_template_labels)); then
+                in_template_labels=0
+                in_template_metadata=0
+            elif [[ "$line" =~ ^[[:space:]]+([a-zA-Z0-9._/-]+):[[:space:]]+([^#]+) ]]; then
+                local key="${BASH_REMATCH[1]}"
+                local val="${BASH_REMATCH[2]}"
+                val="${val%"${val##*[![:space:]]}"}"  # trim trailing spaces
+                template_labels+="${key}=${val};"
+            fi
+        fi
+
+        # Exit template section on major dedent
+        if [[ $in_template -eq 1 ]] && ((indent <= 2)) && [[ ! "$line" =~ ^[[:space:]]*$ ]]; then
+            in_template=0
+            in_template_metadata=0
+            in_template_labels=0
+        fi
+    done
+
+    # Final check for last document
+    if [[ -n "$detected_kind" ]] && [[ -n "$selector_labels" ]] && [[ -n "$template_labels" ]]; then
+        local sorted_selector
+        local sorted_template
+        sorted_selector=$(echo "$selector_labels" | tr ';' '\n' | sort | tr '\n' ';')
+        sorted_template=$(echo "$template_labels" | tr ';' '\n' | sort | tr '\n' ';')
+
+        if [[ "$sorted_selector" != "$sorted_template" ]]; then
+            errors+=("ОШИБКА: selector.matchLabels не соответствует template.metadata.labels")
+            errors+=("  selector: ${selector_labels%;}")
+            errors+=("  template: ${template_labels%;}")
+            errors+=("  Это приведёт к ошибке при применении манифеста")
+        fi
+    fi
+
+    if [[ ${#errors[@]} -gt 0 ]]; then
+        printf '%s\n' "${errors[@]}"
+        return 1
+    fi
+    return 0
+}
+
+check_env_vars() {
+    local file="$1"
+    local line_num=0
+    local errors=()
+    local in_env=0
+    local current_env_name=""
+    local has_value=0
+    local has_valuefrom=0
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Skip comments
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+
+        # Detect env section
+        if [[ "$line" =~ ^[[:space:]]+env:[[:space:]]*$ ]]; then
+            in_env=1
+            continue
+        fi
+
+        # Exit env section on dedent
+        if [[ $in_env -eq 1 ]] && [[ "$line" =~ ^[[:space:]]{0,4}[a-zA-Z] ]] && [[ ! "$line" =~ ^[[:space:]]+-[[:space:]] ]]; then
+            in_env=0
+        fi
+
+        if [[ $in_env -eq 1 ]]; then
+            # New env var
+            if [[ "$line" =~ ^[[:space:]]+-[[:space:]]+name:[[:space:]]+([^[:space:]#]+) ]]; then
+                # Check previous env var
+                if [[ -n "$current_env_name" ]]; then
+                    if [[ $has_value -eq 1 ]] && [[ $has_valuefrom -eq 1 ]]; then
+                        errors+=("ОШИБКА: env '$current_env_name' имеет и value, и valueFrom (допустимо только одно)")
+                    fi
+                fi
+                current_env_name="${BASH_REMATCH[1]}"
+                has_value=0
+                has_valuefrom=0
+
+                # Validate env var name (must match [A-Za-z_][A-Za-z0-9_]*)
+                if [[ ! "$current_env_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+                    errors+=("Строка $line_num: Некорректное имя env переменной: '$current_env_name'")
+                    errors+=("  Должно соответствовать: [A-Za-z_][A-Za-z0-9_]*")
+                fi
+            fi
+
+            # Detect value
+            if [[ "$line" =~ [[:space:]]value:[[:space:]] ]]; then
+                has_value=1
+            fi
+
+            # Detect valueFrom
+            if [[ "$line" =~ [[:space:]]valueFrom:[[:space:]]*$ ]]; then
+                has_valuefrom=1
+            fi
+        fi
+    done < "$file"
+
+    # Check last env var
+    if [[ -n "$current_env_name" ]] && [[ $has_value -eq 1 ]] && [[ $has_valuefrom -eq 1 ]]; then
+        errors+=("ОШИБКА: env '$current_env_name' имеет и value, и valueFrom")
+    fi
+
+    if [[ ${#errors[@]} -gt 0 ]]; then
+        printf '%s\n' "${errors[@]}"
+        return 1
+    fi
+    return 0
+}
+
+check_dns_names() {
+    local file="$1"
+    local line_num=0
+    local errors=()
+
+    # RFC 1123 DNS label: lowercase, alphanumeric, hyphens, max 63 chars
+    # RFC 1123 DNS subdomain: same but allows dots, max 253 chars
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Check metadata.name
+        if [[ "$line" =~ ^[[:space:]]+name:[[:space:]]+([^[:space:]#]+) ]]; then
+            local name="${BASH_REMATCH[1]}"
+            # Remove quotes if present
+            name="${name#[\"\']}"
+            name="${name%[\"\']}"
+
+            # Skip if it's a variable reference
+            [[ "$name" =~ ^\$ ]] && continue
+
+            # Length check (253 for subdomain)
+            if [[ ${#name} -gt 253 ]]; then
+                errors+=("Строка $line_num: Имя '$name' превышает 253 символа (RFC 1123)")
+            fi
+
+            # DNS subdomain pattern check
+            if [[ ! "$name" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$ ]]; then
+                # Check specific violations
+                if [[ "$name" =~ [A-Z] ]]; then
+                    errors+=("Строка $line_num: Имя '$name' содержит заглавные буквы")
+                    errors+=("  RFC 1123 требует только строчные буквы")
+                elif [[ "$name" =~ ^- ]] || [[ "$name" =~ -$ ]]; then
+                    errors+=("Строка $line_num: Имя '$name' не может начинаться/заканчиваться дефисом")
+                elif [[ "$name" =~ [^a-z0-9.-] ]]; then
+                    errors+=("Строка $line_num: Имя '$name' содержит недопустимые символы")
+                    errors+=("  RFC 1123: только [a-z0-9.-]")
+                fi
+            fi
+        fi
+
+        # Check namespace names (stricter: DNS label, max 63 chars)
+        if [[ "$line" =~ ^[[:space:]]+namespace:[[:space:]]+([^[:space:]#]+) ]]; then
+            local ns="${BASH_REMATCH[1]}"
+            ns="${ns#[\"\']}"
+            ns="${ns%[\"\']}"
+
+            [[ "$ns" =~ ^\$ ]] && continue
+
+            if [[ ${#ns} -gt 63 ]]; then
+                errors+=("Строка $line_num: Namespace '$ns' превышает 63 символа")
+            fi
+
+            if [[ ! "$ns" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]]; then
+                errors+=("Строка $line_num: Namespace '$ns' не соответствует RFC 1123 DNS label")
+            fi
+        fi
+    done < "$file"
+
+    if [[ ${#errors[@]} -gt 0 ]]; then
+        printf '%s\n' "${errors[@]}"
+        return 1
+    fi
+    return 0
+}
+
+check_null_values() {
+    local file="$1"
+    local warnings=()
+    local -a lines
+    local line_num=0
+    local total_lines
+
+    # Read all lines into array for lookahead
+    mapfile -t lines < "$file"
+    total_lines=${#lines[@]}
+
+    for ((i=0; i<total_lines; i++)); do
+        local line="${lines[$i]}"
+        line_num=$((i + 1))
+
+        # Skip comments and empty lines
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "${line// /}" ]] && continue
+
+        # Detect explicit null representations
+        if [[ "$line" =~ :[[:space:]]+(null|Null|NULL|~)[[:space:]]*$ ]]; then
+            local value="${BASH_REMATCH[1]}"
+            warnings+=("Строка $line_num: Явное null значение ($value)")
+            warnings+=("  Содержимое: ${line}")
+            warnings+=("  Убедитесь, что null допустим для этого поля")
+        fi
+
+        # Detect empty values (key: with nothing after)
+        # But NOT if next line is indented or is a list item (i.e., it's a parent key)
+        if [[ "$line" =~ ^([[:space:]]*)([a-zA-Z_][a-zA-Z0-9_-]*):[[:space:]]*$ ]]; then
+            local current_indent="${BASH_REMATCH[1]}"
+            local key="${BASH_REMATCH[2]}"
+            local current_indent_len=${#current_indent}
+
+            # Check if next non-empty, non-comment line is a child
+            local has_children=0
+            for ((j=i+1; j<total_lines; j++)); do
+                local next_line="${lines[$j]}"
+                # Skip empty lines and comments
+                [[ -z "${next_line// /}" ]] && continue
+                [[ "$next_line" =~ ^[[:space:]]*# ]] && continue
+
+                # Get next line indent
+                if [[ "$next_line" =~ ^([[:space:]]*) ]]; then
+                    local next_indent_len=${#BASH_REMATCH[1]}
+                    # Child exists if: more indented OR list item at same level
+                    if ((next_indent_len > current_indent_len)); then
+                        has_children=1
+                    elif [[ "$next_line" =~ ^[[:space:]]*-[[:space:]] ]]; then
+                        # List item at same or greater indent is also a child
+                        has_children=1
+                    fi
+                fi
+                break
+            done
+
+            # Only warn if no children (actual empty value)
+            if [[ $has_children -eq 0 ]]; then
+                warnings+=("Строка $line_num: Пустое значение для ключа (интерпретируется как null)")
+                warnings+=("  Ключ: $key")
+                warnings+=("  Рекомендация: Удалите ключ или укажите значение")
+            fi
+        fi
+    done
+
+    if [[ ${#warnings[@]} -gt 0 ]]; then
+        printf '%s\n' "${warnings[@]}"
+    fi
+    return 0
+}
+
+check_flow_style() {
+    local file="$1"
+    local line_num=0
+    local errors=()
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Skip comments and strings
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+
+        # Detect flow mappings { }
+        if [[ "$line" =~ \{[^\}]*$ ]] && [[ ! "$line" =~ \{[^\}]*\} ]]; then
+            errors+=("Строка $line_num: Незакрытый flow mapping '{'")
+            errors+=("  Содержимое: ${line}")
+        fi
+
+        # Detect flow sequences [ ]
+        if [[ "$line" =~ \[[^\]]*$ ]] && [[ ! "$line" =~ \[[^\]]*\] ]]; then
+            errors+=("Строка $line_num: Незакрытая flow sequence '['")
+            errors+=("  Содержимое: ${line}")
+        fi
+
+        # Check for unquoted special chars in flow style
+        if [[ "$line" =~ \{.*:.*[^\"\']\} ]] || [[ "$line" =~ \[.*:.*[^\"\']\] ]]; then
+            # Check for unquoted colons in flow style values
+            if [[ "$line" =~ \{[^\}]*:[[:space:]]+[^\"\'][^,\}]*:[^\"\'][^\}]*\} ]]; then
+                errors+=("Строка $line_num: ПРЕДУПРЕЖДЕНИЕ: Потенциально незакавыченное значение с ':' в flow style")
+                errors+=("  Содержимое: ${line}")
+            fi
+        fi
+
+        # Deep nesting warning (more than 3 levels)
+        local open_braces="${line//[^\{]/}"
+        local open_brackets="${line//[^\[]/}"
+        if [[ ${#open_braces} -gt 3 ]] || [[ ${#open_brackets} -gt 3 ]]; then
+            errors+=("Строка $line_num: ПРЕДУПРЕЖДЕНИЕ: Глубокая вложенность в flow style (>3)")
+            errors+=("  Рекомендация: Используйте block style для читаемости")
+        fi
+    done < "$file"
+
+    if [[ ${#errors[@]} -gt 0 ]]; then
+        printf '%s\n' "${errors[@]}"
+        return 1
+    fi
+    return 0
+}
+
+check_container_name() {
+    local file="$1"
+    local errors=()
+    local -a lines
+    mapfile -t lines < "$file"
+    local total_lines=${#lines[@]}
+
+    local in_containers=0
+    local containers_indent=0
+    local container_item_indent=-1  # The exact indent where container items start
+
+    for ((i=0; i<total_lines; i++)); do
+        local line="${lines[$i]}"
+        local line_num=$((i + 1))
+
+        # Skip comments and empty lines
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "${line// /}" ]] && continue
+
+        # Get current line indent
+        local indent=0
+        if [[ "$line" =~ ^([[:space:]]*) ]]; then
+            indent=${#BASH_REMATCH[1]}
+        fi
+
+        # Detect containers: or initContainers: section
+        if [[ "$line" =~ ^([[:space:]]*)(containers|initContainers):[[:space:]]*$ ]]; then
+            in_containers=1
+            containers_indent=${#BASH_REMATCH[1]}
+            container_item_indent=-1
+            continue
+        fi
+
+        # Exit containers on dedent back to or below containers level
+        if [[ $in_containers -eq 1 ]] && ((indent <= containers_indent)) && [[ ! "$line" =~ ^[[:space:]]*-[[:space:]] ]]; then
+            in_containers=0
+            continue
+        fi
+
+        if [[ $in_containers -eq 1 ]]; then
+            # Check for first container item to determine the exact indent
+            if [[ "$line" =~ ^([[:space:]]*)-[[:space:]]+name:[[:space:]]+([^[:space:]#]+) ]]; then
+                local item_indent=${#BASH_REMATCH[1]}
+
+                # Set the container item indent on first container found
+                if [[ $container_item_indent -eq -1 ]]; then
+                    container_item_indent=$item_indent
+                fi
+
+                # Only validate if this item is at the container level indent
+                # (not deeper, which would be env vars, ports, etc.)
+                if [[ $item_indent -eq $container_item_indent ]]; then
+                    local name="${BASH_REMATCH[2]}"
+                    name="${name#[\"\']}"
+                    name="${name%[\"\']}"
+
+                    # Container name must be RFC 1123 DNS label (max 63 chars)
+                    if [[ ${#name} -gt 63 ]]; then
+                        errors+=("Строка $line_num: Имя контейнера '$name' превышает 63 символа")
+                    fi
+
+                    if [[ ! "$name" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]]; then
+                        if [[ "$name" =~ [A-Z] ]]; then
+                            errors+=("Строка $line_num: Имя контейнера '$name' содержит заглавные буквы")
+                        elif [[ "$name" =~ _ ]]; then
+                            errors+=("Строка $line_num: Имя контейнера '$name' содержит подчёркивание (недопустимо)")
+                            errors+=("  Используйте дефис вместо подчёркивания")
+                        else
+                            errors+=("Строка $line_num: Имя контейнера '$name' не соответствует RFC 1123")
+                        fi
+                    fi
+                fi
+            fi
+        fi
+    done
+
+    if [[ ${#errors[@]} -gt 0 ]]; then
+        printf '%s\n' "${errors[@]}"
+        return 1
+    fi
+    return 0
+}
+
+check_security_best_practices() {
+    local file="$1"
+    local line_num=0
+    local warnings=()
+    local has_security_context=0
+    local has_run_as_non_root=0
+    local has_read_only_fs=0
+    local in_security_context=0
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Skip comments
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+
+        # Detect securityContext
+        if [[ "$line" =~ securityContext:[[:space:]]*$ ]]; then
+            has_security_context=1
+            in_security_context=1
+            continue
+        fi
+
+        if [[ $in_security_context -eq 1 ]]; then
+            # runAsNonRoot check
+            if [[ "$line" =~ runAsNonRoot:[[:space:]]+(true|True|TRUE) ]]; then
+                has_run_as_non_root=1
+            fi
+
+            # readOnlyRootFilesystem check
+            if [[ "$line" =~ readOnlyRootFilesystem:[[:space:]]+(true|True|TRUE) ]]; then
+                has_read_only_fs=1
+            fi
+
+            # allowPrivilegeEscalation check
+            if [[ "$line" =~ allowPrivilegeEscalation:[[:space:]]+(true|True|TRUE) ]]; then
+                warnings+=("Строка $line_num: БЕЗОПАСНОСТЬ: allowPrivilegeEscalation: true")
+                warnings+=("  Рекомендация: Установите allowPrivilegeEscalation: false")
+            fi
+
+            # runAsUser: 0 (root)
+            if [[ "$line" =~ runAsUser:[[:space:]]+0[[:space:]]*$ ]]; then
+                warnings+=("Строка $line_num: БЕЗОПАСНОСТЬ: runAsUser: 0 (контейнер запущен как root)")
+                warnings+=("  Рекомендация: Используйте непривилегированного пользователя")
+            fi
+        fi
+
+        # hostPID / hostIPC / hostNetwork
+        if [[ "$line" =~ hostPID:[[:space:]]+(true|True|TRUE) ]]; then
+            warnings+=("Строка $line_num: БЕЗОПАСНОСТЬ: hostPID: true — доступ к процессам хоста")
+        fi
+        if [[ "$line" =~ hostIPC:[[:space:]]+(true|True|TRUE) ]]; then
+            warnings+=("Строка $line_num: БЕЗОПАСНОСТЬ: hostIPC: true — доступ к IPC хоста")
+        fi
+        if [[ "$line" =~ hostNetwork:[[:space:]]+(true|True|TRUE) ]]; then
+            warnings+=("Строка $line_num: БЕЗОПАСНОСТЬ: hostNetwork: true — доступ к сети хоста")
+        fi
+
+        # hostPath volumes
+        if [[ "$line" =~ hostPath:[[:space:]]*$ ]]; then
+            warnings+=("Строка $line_num: БЕЗОПАСНОСТЬ: hostPath volume — доступ к файловой системе хоста")
+            warnings+=("  Риск: Потенциальный container escape")
+        fi
+
+        # Exit securityContext on dedent
+        if [[ $in_security_context -eq 1 ]] && [[ "$line" =~ ^[[:space:]]{0,6}[a-zA-Z] ]] && [[ ! "$line" =~ securityContext ]]; then
+            in_security_context=0
+        fi
+    done < "$file"
+
+    # Best practice recommendations (only if there are containers)
+    if grep -q "containers:" "$file" 2>/dev/null; then
+        if [[ $has_security_context -eq 0 ]]; then
+            warnings+=("РЕКОМЕНДАЦИЯ: Отсутствует securityContext")
+            warnings+=("  Добавьте securityContext с runAsNonRoot: true, readOnlyRootFilesystem: true")
+        else
+            if [[ $has_run_as_non_root -eq 0 ]]; then
+                warnings+=("РЕКОМЕНДАЦИЯ: runAsNonRoot не установлен")
+            fi
+            if [[ $has_read_only_fs -eq 0 ]]; then
+                warnings+=("РЕКОМЕНДАЦИЯ: readOnlyRootFilesystem не установлен")
+            fi
+        fi
+    fi
+
+    if [[ ${#warnings[@]} -gt 0 ]]; then
+        printf '%s\n' "${warnings[@]}"
+    fi
+    return 0
+}
+
+check_resource_format() {
+    local file="$1"
+    local line_num=0
+    local errors=()
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # CPU format validation
+        if [[ "$line" =~ cpu:[[:space:]]+([^[:space:]#]+) ]]; then
+            local cpu="${BASH_REMATCH[1]}"
+            cpu="${cpu#[\"\']}"
+            cpu="${cpu%[\"\']}"
+
+            # Valid formats: integer, decimal (0.5), millicore (100m, 500m)
+            if [[ ! "$cpu" =~ ^[0-9]+$ ]] && \
+               [[ ! "$cpu" =~ ^[0-9]+\.[0-9]+$ ]] && \
+               [[ ! "$cpu" =~ ^[0-9]+m$ ]]; then
+                errors+=("Строка $line_num: Некорректный формат CPU: '$cpu'")
+                errors+=("  Допустимо: 1, 0.5, 100m, 500m, 2000m")
+            fi
+
+            # Warning for very high CPU
+            if [[ "$cpu" =~ ^([0-9]+)$ ]] && [[ ${BASH_REMATCH[1]} -gt 64 ]]; then
+                errors+=("Строка $line_num: ПРЕДУПРЕЖДЕНИЕ: CPU $cpu очень высокий (>64 cores)")
+            fi
+        fi
+
+        # Memory format validation
+        if [[ "$line" =~ memory:[[:space:]]+([^[:space:]#]+) ]]; then
+            local mem="${BASH_REMATCH[1]}"
+            mem="${mem#[\"\']}"
+            mem="${mem%[\"\']}"
+
+            # Valid formats: bytes, Ki/Mi/Gi/Ti, K/M/G/T
+            if [[ ! "$mem" =~ ^[0-9]+$ ]] && \
+               [[ ! "$mem" =~ ^[0-9]+(Ki|Mi|Gi|Ti|Pi|Ei)$ ]] && \
+               [[ ! "$mem" =~ ^[0-9]+(K|M|G|T|P|E)$ ]] && \
+               [[ ! "$mem" =~ ^[0-9]+e[0-9]+$ ]]; then
+                errors+=("Строка $line_num: Некорректный формат memory: '$mem'")
+                errors+=("  Допустимо: 128Mi, 1Gi, 512M, 1G")
+            fi
+
+            # Warning for lowercase m (millibytes - almost certainly wrong)
+            if [[ "$mem" =~ ^[0-9]+m$ ]]; then
+                errors+=("Строка $line_num: ОШИБКА: memory '$mem' использует 'm' (миллибайты)")
+                errors+=("  Вероятно имелось в виду: ${mem%m}Mi (мебибайты)")
+            fi
+
+            # Warning for very high memory
+            if [[ "$mem" =~ ^([0-9]+)Gi$ ]] && [[ ${BASH_REMATCH[1]} -gt 256 ]]; then
+                errors+=("Строка $line_num: ПРЕДУПРЕЖДЕНИЕ: Memory ${mem} очень высокий (>256Gi)")
+            fi
+        fi
+    done < "$file"
+
+    if [[ ${#errors[@]} -gt 0 ]]; then
+        printf '%s\n' "${errors[@]}"
+        return 1
+    fi
+    return 0
+}
+
+check_service_selector() {
+    local file="$1"
+    local line_num=0
+    local errors=()
+    local detected_kind=""
+    local in_selector=0
+    local selector_indent=0
+    local has_selector=0
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Detect Service kind
+        if [[ "$line" =~ ^kind:[[:space:]]+Service ]]; then
+            detected_kind="Service"
+        fi
+
+        # Reset on document separator
+        if [[ "$line" =~ ^---[[:space:]]*$ ]]; then
+            if [[ "$detected_kind" == "Service" ]] && [[ $has_selector -eq 0 ]]; then
+                errors+=("ПРЕДУПРЕЖДЕНИЕ: Service без selector (headless service или ошибка?)")
+            fi
+            detected_kind=""
+            has_selector=0
+            in_selector=0
+        fi
+
+        # Detect selector in Service
+        if [[ "$detected_kind" == "Service" ]]; then
+            if [[ "$line" =~ ^([[:space:]]*)selector:[[:space:]]*$ ]]; then
+                in_selector=1
+                selector_indent=${#BASH_REMATCH[1]}
+                has_selector=1
+                continue
+            fi
+
+            # Check for empty selector
+            if [[ $in_selector -eq 1 ]]; then
+                local current_indent
+                if [[ "$line" =~ ^([[:space:]]*)[a-zA-Z] ]]; then
+                    current_indent=${#BASH_REMATCH[1]}
+                    if [[ $current_indent -le $selector_indent ]]; then
+                        in_selector=0
+                    fi
+                fi
+            fi
+        fi
+    done < "$file"
+
+    # Final check
+    if [[ "$detected_kind" == "Service" ]] && [[ $has_selector -eq 0 ]]; then
+        errors+=("ПРЕДУПРЕЖДЕНИЕ: Service без selector")
+    fi
+
+    if [[ ${#errors[@]} -gt 0 ]]; then
+        printf '%s\n' "${errors[@]}"
+    fi
+    return 0
+}
+
+check_volume_mounts() {
+    local file="$1"
+    local line_num=0
+    local errors=()
+    local in_volume_mounts=0
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Detect volumeMounts section
+        if [[ "$line" =~ volumeMounts:[[:space:]]*$ ]]; then
+            in_volume_mounts=1
+            continue
+        fi
+
+        if [[ $in_volume_mounts -eq 1 ]]; then
+            # Check mountPath
+            if [[ "$line" =~ mountPath:[[:space:]]+([^[:space:]#]+) ]]; then
+                local path="${BASH_REMATCH[1]}"
+                path="${path#[\"\']}"
+                path="${path%[\"\']}"
+
+                # Dangerous mount paths
+                if [[ "$path" == "/" ]]; then
+                    errors+=("Строка $line_num: БЕЗОПАСНОСТЬ: mountPath: / — монтирование в корень")
+                fi
+                if [[ "$path" == "/etc" ]] || [[ "$path" =~ ^/etc/ ]]; then
+                    errors+=("Строка $line_num: ПРЕДУПРЕЖДЕНИЕ: mountPath в /etc")
+                fi
+                if [[ "$path" == "/var/run/docker.sock" ]]; then
+                    errors+=("Строка $line_num: БЕЗОПАСНОСТЬ: Docker socket mounted — container escape risk")
+                fi
+                if [[ "$path" =~ /proc ]] || [[ "$path" =~ /sys ]]; then
+                    errors+=("Строка $line_num: БЕЗОПАСНОСТЬ: mountPath в системную директорию ($path)")
+                fi
+
+                # Relative path
+                if [[ ! "$path" =~ ^/ ]]; then
+                    errors+=("Строка $line_num: mountPath '$path' должен быть абсолютным путём")
+                fi
+            fi
+
+            # subPath injection check (CVE-2023-3676)
+            if [[ "$line" =~ subPath:[[:space:]]+([^[:space:]#]+) ]]; then
+                local subpath="${BASH_REMATCH[1]}"
+                if [[ "$subpath" =~ \.\. ]] || [[ "$subpath" =~ [\`\$\;] ]]; then
+                    errors+=("Строка $line_num: БЕЗОПАСНОСТЬ: Подозрительный subPath: '$subpath'")
+                    errors+=("  Возможная уязвимость: CVE-2023-3676 command injection")
+                fi
+            fi
+
+            # Exit volumeMounts on dedent
+            if [[ "$line" =~ ^[[:space:]]{0,6}[a-zA-Z] ]] && [[ ! "$line" =~ ^[[:space:]]+-[[:space:]] ]]; then
+                in_volume_mounts=0
+            fi
+        fi
+    done < "$file"
+
+    if [[ ${#errors[@]} -gt 0 ]]; then
+        printf '%s\n' "${errors[@]}"
+        return 1
+    fi
+    return 0
+}
+
+check_configmap_keys() {
+    local file="$1"
+    local line_num=0
+    local errors=()
+    local in_data=0
+    local detected_kind=""
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Detect ConfigMap/Secret kind
+        if [[ "$line" =~ ^kind:[[:space:]]+(ConfigMap|Secret) ]]; then
+            detected_kind="${BASH_REMATCH[1]}"
+        fi
+
+        # Detect data section
+        if [[ "$line" =~ ^data:[[:space:]]*$ ]] || [[ "$line" =~ ^stringData:[[:space:]]*$ ]]; then
+            in_data=1
+            continue
+        fi
+
+        # Reset on new document
+        if [[ "$line" =~ ^---[[:space:]]*$ ]]; then
+            detected_kind=""
+            in_data=0
+        fi
+
+        # Validate keys in ConfigMap/Secret data
+        if [[ $in_data -eq 1 ]] && [[ -n "$detected_kind" ]]; then
+            if [[ "$line" =~ ^[[:space:]]+([a-zA-Z0-9._-]+):[[:space:]] ]]; then
+                local key="${BASH_REMATCH[1]}"
+
+                # Key must be valid DNS subdomain (RFC 1123) or path segment
+                # Max 253 chars, alphanumeric, -, _, .
+                if [[ ${#key} -gt 253 ]]; then
+                    errors+=("Строка $line_num: $detected_kind ключ '$key' превышает 253 символа")
+                fi
+
+                # Check for potentially problematic keys
+                if [[ "$key" =~ ^[0-9] ]]; then
+                    errors+=("Строка $line_num: ПРЕДУПРЕЖДЕНИЕ: $detected_kind ключ '$key' начинается с цифры")
+                fi
+
+                if [[ "$key" =~ [[:space:]] ]]; then
+                    errors+=("Строка $line_num: $detected_kind ключ '$key' содержит пробелы")
+                fi
+            fi
+
+            # Exit data on dedent
+            if [[ "$line" =~ ^[a-zA-Z] ]]; then
+                in_data=0
+            fi
+        fi
+    done < "$file"
+
+    if [[ ${#errors[@]} -gt 0 ]]; then
+        printf '%s\n' "${errors[@]}"
+        return 1
+    fi
+    return 0
+}
+
+check_ingress_rules() {
+    local file="$1"
+    local line_num=0
+    local errors=()
+    local detected_kind=""
+    local detected_api=""
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Detect apiVersion
+        if [[ "$line" =~ ^apiVersion:[[:space:]]+([^[:space:]#]+) ]]; then
+            detected_api="${BASH_REMATCH[1]}"
+        fi
+
+        # Detect Ingress kind
+        if [[ "$line" =~ ^kind:[[:space:]]+Ingress ]]; then
+            detected_kind="Ingress"
+        fi
+
+        # Reset on document separator
+        if [[ "$line" =~ ^---[[:space:]]*$ ]]; then
+            detected_kind=""
+            detected_api=""
+        fi
+
+        if [[ "$detected_kind" == "Ingress" ]]; then
+            # Check for deprecated API (already handled but reinforce)
+            if [[ "$detected_api" == "extensions/v1beta1" ]] || [[ "$detected_api" == "networking.k8s.io/v1beta1" ]]; then
+                # Already handled in check_deprecated_api
+                :
+            fi
+
+            # Check for missing ingressClassName (required in v1)
+            if [[ "$detected_api" == "networking.k8s.io/v1" ]]; then
+                if [[ "$line" =~ ^spec:[[:space:]]*$ ]]; then
+                    # Should have ingressClassName
+                    :
+                fi
+            fi
+
+            # Validate host format
+            if [[ "$line" =~ ^[[:space:]]+-[[:space:]]+host:[[:space:]]+([^[:space:]#]+) ]]; then
+                local host="${BASH_REMATCH[1]}"
+                host="${host#[\"\']}"
+                host="${host%[\"\']}"
+
+                # Basic hostname validation
+                if [[ ! "$host" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$ ]] && [[ "$host" != "*" ]]; then
+                    errors+=("Строка $line_num: Некорректный hostname в Ingress: '$host'")
+                fi
+            fi
+
+            # Check path type (required in v1)
+            if [[ "$line" =~ pathType:[[:space:]]+([^[:space:]#]+) ]]; then
+                local pathtype="${BASH_REMATCH[1]}"
+                if [[ ! "$pathtype" =~ ^(Prefix|Exact|ImplementationSpecific)$ ]]; then
+                    errors+=("Строка $line_num: Некорректный pathType: '$pathtype'")
+                    errors+=("  Допустимо: Prefix, Exact, ImplementationSpecific")
+                fi
+            fi
+        fi
+    done < "$file"
+
+    if [[ ${#errors[@]} -gt 0 ]]; then
+        printf '%s\n' "${errors[@]}"
+        return 1
+    fi
+    return 0
+}
+
+check_hpa_config() {
+    local file="$1"
+    local line_num=0
+    local errors=()
+    local detected_kind=""
+    local min_replicas=0
+    local max_replicas=0
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Detect HPA kind
+        if [[ "$line" =~ ^kind:[[:space:]]+HorizontalPodAutoscaler ]]; then
+            detected_kind="HPA"
+        fi
+
+        # Reset on document separator
+        if [[ "$line" =~ ^---[[:space:]]*$ ]]; then
+            # Validate HPA config
+            if [[ "$detected_kind" == "HPA" ]]; then
+                if [[ $min_replicas -gt $max_replicas ]] && [[ $max_replicas -gt 0 ]]; then
+                    errors+=("ОШИБКА: HPA minReplicas ($min_replicas) > maxReplicas ($max_replicas)")
+                fi
+                if [[ $min_replicas -eq 0 ]]; then
+                    errors+=("ПРЕДУПРЕЖДЕНИЕ: HPA minReplicas = 0 может привести к отсутствию pods")
+                fi
+            fi
+            detected_kind=""
+            min_replicas=0
+            max_replicas=0
+        fi
+
+        if [[ "$detected_kind" == "HPA" ]]; then
+            # Get minReplicas
+            if [[ "$line" =~ minReplicas:[[:space:]]+([0-9]+) ]]; then
+                min_replicas="${BASH_REMATCH[1]}"
+            fi
+
+            # Get maxReplicas
+            if [[ "$line" =~ maxReplicas:[[:space:]]+([0-9]+) ]]; then
+                max_replicas="${BASH_REMATCH[1]}"
+            fi
+
+            # Check target CPU utilization
+            if [[ "$line" =~ targetCPUUtilizationPercentage:[[:space:]]+([0-9]+) ]]; then
+                local cpu="${BASH_REMATCH[1]}"
+                if [[ $cpu -gt 100 ]]; then
+                    errors+=("Строка $line_num: HPA targetCPUUtilizationPercentage > 100% ($cpu)")
+                fi
+                if [[ $cpu -lt 10 ]]; then
+                    errors+=("Строка $line_num: ПРЕДУПРЕЖДЕНИЕ: HPA targetCPU очень низкий ($cpu%)")
+                fi
+            fi
+        fi
+    done < "$file"
+
+    # Final check
+    if [[ "$detected_kind" == "HPA" ]]; then
+        if [[ $min_replicas -gt $max_replicas ]] && [[ $max_replicas -gt 0 ]]; then
+            errors+=("ОШИБКА: HPA minReplicas ($min_replicas) > maxReplicas ($max_replicas)")
+        fi
+    fi
+
+    if [[ ${#errors[@]} -gt 0 ]]; then
+        printf '%s\n' "${errors[@]}"
+        return 1
+    fi
+    return 0
+}
+
+check_pdb_config() {
+    local file="$1"
+    local line_num=0
+    local errors=()
+    local detected_kind=""
+    local has_min_available=0
+    local has_max_unavailable=0
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Detect PDB kind
+        if [[ "$line" =~ ^kind:[[:space:]]+PodDisruptionBudget ]]; then
+            detected_kind="PDB"
+        fi
+
+        # Reset on document separator
+        if [[ "$line" =~ ^---[[:space:]]*$ ]]; then
+            if [[ "$detected_kind" == "PDB" ]]; then
+                if [[ $has_min_available -eq 1 ]] && [[ $has_max_unavailable -eq 1 ]]; then
+                    errors+=("ОШИБКА: PDB имеет и minAvailable, и maxUnavailable (допустимо только одно)")
+                fi
+                if [[ $has_min_available -eq 0 ]] && [[ $has_max_unavailable -eq 0 ]]; then
+                    errors+=("ОШИБКА: PDB требует minAvailable или maxUnavailable")
+                fi
+            fi
+            detected_kind=""
+            has_min_available=0
+            has_max_unavailable=0
+        fi
+
+        if [[ "$detected_kind" == "PDB" ]]; then
+            if [[ "$line" =~ minAvailable:[[:space:]]+ ]]; then
+                has_min_available=1
+            fi
+            if [[ "$line" =~ maxUnavailable:[[:space:]]+ ]]; then
+                has_max_unavailable=1
+            fi
+        fi
+    done < "$file"
+
+    # Final check
+    if [[ "$detected_kind" == "PDB" ]]; then
+        if [[ $has_min_available -eq 1 ]] && [[ $has_max_unavailable -eq 1 ]]; then
+            errors+=("ОШИБКА: PDB имеет и minAvailable, и maxUnavailable")
+        fi
+    fi
+
+    if [[ ${#errors[@]} -gt 0 ]]; then
+        printf '%s\n' "${errors[@]}"
+        return 1
+    fi
+    return 0
+}
+
+check_cronjob_schedule() {
+    local file="$1"
+    local line_num=0
+    local errors=()
+    local detected_kind=""
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Detect CronJob kind
+        if [[ "$line" =~ ^kind:[[:space:]]+CronJob ]]; then
+            detected_kind="CronJob"
+        fi
+
+        # Reset on document separator
+        if [[ "$line" =~ ^---[[:space:]]*$ ]]; then
+            detected_kind=""
+        fi
+
+        if [[ "$detected_kind" == "CronJob" ]]; then
+            # Validate schedule format
+            if [[ "$line" =~ schedule:[[:space:]]+[\"\']?([^\"\'#]+)[\"\']? ]]; then
+                local schedule="${BASH_REMATCH[1]}"
+                schedule="${schedule#[\"\']}"
+                schedule="${schedule%[\"\']}"
+                schedule="${schedule% }"  # Trim trailing space
+
+                # Count fields (should be 5 for standard cron)
+                local field_count
+                field_count=$(echo "$schedule" | awk '{print NF}')
+
+                if [[ $field_count -ne 5 ]]; then
+                    errors+=("Строка $line_num: CronJob schedule должен иметь 5 полей: '$schedule' (найдено: $field_count)")
+                    errors+=("  Формат: минута час день месяц день_недели")
+                fi
+
+                # Check for very frequent schedules
+                if [[ "$schedule" =~ ^\*/1[[:space:]] ]] || [[ "$schedule" =~ ^\*[[:space:]] ]]; then
+                    errors+=("Строка $line_num: ПРЕДУПРЕЖДЕНИЕ: CronJob запускается каждую минуту")
+                    errors+=("  Это может создать высокую нагрузку")
+                fi
+            fi
+
+            # Check concurrencyPolicy
+            if [[ "$line" =~ concurrencyPolicy:[[:space:]]+([^[:space:]#]+) ]]; then
+                local policy="${BASH_REMATCH[1]}"
+                if [[ ! "$policy" =~ ^(Allow|Forbid|Replace)$ ]]; then
+                    errors+=("Строка $line_num: Некорректный concurrencyPolicy: '$policy'")
+                    errors+=("  Допустимо: Allow, Forbid, Replace")
+                fi
+            fi
+
+            # Check successfulJobsHistoryLimit / failedJobsHistoryLimit
+            if [[ "$line" =~ successfulJobsHistoryLimit:[[:space:]]+([0-9]+) ]]; then
+                local limit="${BASH_REMATCH[1]}"
+                if [[ $limit -gt 100 ]]; then
+                    errors+=("Строка $line_num: ПРЕДУПРЕЖДЕНИЕ: successfulJobsHistoryLimit очень высокий ($limit)")
+                fi
+            fi
+        fi
+    done < "$file"
+
+    if [[ ${#errors[@]} -gt 0 ]]; then
+        printf '%s\n' "${errors[@]}"
+        return 1
+    fi
+    return 0
+}
+
 validate_yaml_file() {
     local file="$1"
     local verbose="$2"
@@ -2526,12 +3707,162 @@ validate_yaml_file() {
     fi
 
     if [[ $verbose -eq 1 ]]; then
-        echo -e "  ${CYAN}└─ Проверка Deckhouse CRD...${NC}"
+        echo -e "  ${CYAN}├─ Проверка Deckhouse CRD...${NC}"
     fi
     local deckhouse_errors
     if ! deckhouse_errors=$(check_deckhouse_crd "$file"); then
         file_errors+=("=== DECKHOUSE: CRD VALIDATION ===")
         file_errors+=("$deckhouse_errors")
+    fi
+
+    # === NEW CHECKS v2.4.0 ===
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка deprecated API versions...${NC}"
+    fi
+    local deprecated_api_warnings
+    deprecated_api_warnings=$(check_deprecated_api "$file")
+    if [[ -n "$deprecated_api_warnings" ]]; then
+        file_errors+=("=== KUBERNETES: DEPRECATED API ===")
+        file_errors+=("$deprecated_api_warnings")
+    fi
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка selector/template labels...${NC}"
+    fi
+    local selector_errors
+    if ! selector_errors=$(check_selector_match "$file"); then
+        file_errors+=("=== KUBERNETES: SELECTOR MISMATCH ===")
+        file_errors+=("$selector_errors")
+    fi
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка environment variables...${NC}"
+    fi
+    local env_errors
+    if ! env_errors=$(check_env_vars "$file"); then
+        file_errors+=("=== KUBERNETES: ENV VARS ===")
+        file_errors+=("$env_errors")
+    fi
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка DNS names (RFC 1123)...${NC}"
+    fi
+    local dns_errors
+    if ! dns_errors=$(check_dns_names "$file"); then
+        file_errors+=("=== KUBERNETES: DNS NAMES ===")
+        file_errors+=("$dns_errors")
+    fi
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка null values...${NC}"
+    fi
+    local null_warnings
+    null_warnings=$(check_null_values "$file")
+    if [[ -n "$null_warnings" ]]; then
+        file_errors+=("=== YAML: NULL VALUES ===")
+        file_errors+=("$null_warnings")
+    fi
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка flow style (inline JSON)...${NC}"
+    fi
+    local flow_errors
+    if ! flow_errors=$(check_flow_style "$file"); then
+        file_errors+=("=== YAML: FLOW STYLE ===")
+        file_errors+=("$flow_errors")
+    fi
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка container names...${NC}"
+    fi
+    local container_name_errors
+    if ! container_name_errors=$(check_container_name "$file"); then
+        file_errors+=("=== KUBERNETES: CONTAINER NAMES ===")
+        file_errors+=("$container_name_errors")
+    fi
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка security best practices...${NC}"
+    fi
+    local security_bp_warnings
+    security_bp_warnings=$(check_security_best_practices "$file")
+    if [[ -n "$security_bp_warnings" ]]; then
+        file_errors+=("=== БЕЗОПАСНОСТЬ: BEST PRACTICES ===")
+        file_errors+=("$security_bp_warnings")
+    fi
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка resource format (cpu/memory)...${NC}"
+    fi
+    local resource_fmt_errors
+    if ! resource_fmt_errors=$(check_resource_format "$file"); then
+        file_errors+=("=== KUBERNETES: RESOURCE FORMAT ===")
+        file_errors+=("$resource_fmt_errors")
+    fi
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка Service selector...${NC}"
+    fi
+    local svc_selector_warnings
+    svc_selector_warnings=$(check_service_selector "$file")
+    if [[ -n "$svc_selector_warnings" ]]; then
+        file_errors+=("=== KUBERNETES: SERVICE SELECTOR ===")
+        file_errors+=("$svc_selector_warnings")
+    fi
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка volume mounts (CVE-2023-3676)...${NC}"
+    fi
+    local volume_errors
+    if ! volume_errors=$(check_volume_mounts "$file"); then
+        file_errors+=("=== БЕЗОПАСНОСТЬ: VOLUME MOUNTS ===")
+        file_errors+=("$volume_errors")
+    fi
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка ConfigMap keys...${NC}"
+    fi
+    local cm_key_errors
+    if ! cm_key_errors=$(check_configmap_keys "$file"); then
+        file_errors+=("=== KUBERNETES: CONFIGMAP KEYS ===")
+        file_errors+=("$cm_key_errors")
+    fi
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка Ingress rules...${NC}"
+    fi
+    local ingress_errors
+    if ! ingress_errors=$(check_ingress_rules "$file"); then
+        file_errors+=("=== KUBERNETES: INGRESS ===")
+        file_errors+=("$ingress_errors")
+    fi
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка HPA config...${NC}"
+    fi
+    local hpa_errors
+    if ! hpa_errors=$(check_hpa_config "$file"); then
+        file_errors+=("=== KUBERNETES: HPA ===")
+        file_errors+=("$hpa_errors")
+    fi
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка PodDisruptionBudget...${NC}"
+    fi
+    local pdb_errors
+    if ! pdb_errors=$(check_pdb_config "$file"); then
+        file_errors+=("=== KUBERNETES: PDB ===")
+        file_errors+=("$pdb_errors")
+    fi
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}└─ Проверка CronJob schedule...${NC}"
+    fi
+    local cronjob_errors
+    if ! cronjob_errors=$(check_cronjob_schedule "$file"); then
+        file_errors+=("=== KUBERNETES: CRONJOB ===")
+        file_errors+=("$cronjob_errors")
     fi
 
     if [[ ${#file_errors[@]} -eq 0 ]]; then
