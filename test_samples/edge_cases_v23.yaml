@@ -1,0 +1,69 @@
+# Test: Edge cases for v2.3.0 new checks
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: test-deployment
+  labels:
+    app: test
+spec:
+  replicas: "3"  # ERROR: should be number, not string
+  selector:
+    matchLabels:
+      app: test
+  template:
+    metadata:
+      labels:
+        app: test
+    spec:
+      containers:
+        - name: app
+          image: nginx  # WARNING: no tag (defaults to :latest)
+          imagePullPolicy: always  # ERROR: should be Always (case-sensitive)
+          ports:
+            - containerPort: 80
+          securityContext:
+            privileged: true  # SECURITY WARNING
+            allowPrivilegeEscalation: true  # SECURITY WARNING
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 80
+            initialDelaySeconds: 0  # WARNING: may kill pod
+            timeoutSeconds: 1  # WARNING: too small
+---
+# Test: Norway Problem
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: norway-test
+data:
+  # These are booleans in YAML 1.1, not strings!
+  country_code: NO
+  answer: y
+  enabled: n
+  # Sexagesimal (base-60) - these are numbers!
+  time: 21:00
+  duration: 1:30:00
+---
+# Test: Service type case sensitivity
+apiVersion: v1
+kind: Service
+metadata:
+  name: test-service
+spec:
+  type: nodeport  # ERROR: should be NodePort
+  selector:
+    app: test
+  ports:
+    - port: 80
+---
+# Test: RestartPolicy
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test-pod
+spec:
+  restartPolicy: always  # ERROR: should be Always
+  containers:
+    - name: test
+      image: nginx:latest  # WARNING: floating tag
