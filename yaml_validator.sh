@@ -6,6 +6,7 @@
 # Purpose: Validate YAML files in Kubernetes clusters without external tools
 # Author: Generated for isolated environments
 # Version: 2.4.0
+# Updated: 2026-01-23
 #############################################################################
 
 set -o pipefail
