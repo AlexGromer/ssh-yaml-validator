@@ -581,6 +581,7 @@ check_kubernetes_specific() {
 
     # Kubernetes + Deckhouse field dictionary
     # Top-level fields (case-sensitive)
+    # shellcheck disable=SC2034  # Dictionary for future validation features
     local -A k8s_top_fields=(
         ["apiVersion"]="top"
         ["kind"]="top"
@@ -599,6 +600,7 @@ check_kubernetes_specific() {
     )
 
     # Metadata fields
+    # shellcheck disable=SC2034  # Dictionary for future validation features
     local -A k8s_metadata_fields=(
         ["name"]="metadata"
         ["namespace"]="metadata"
@@ -618,6 +620,7 @@ check_kubernetes_specific() {
     )
 
     # Spec fields (common across resources)
+    # shellcheck disable=SC2034  # Dictionary for future validation features
     local -A k8s_spec_fields=(
         ["containers"]="spec"
         ["initContainers"]="spec"
@@ -691,6 +694,7 @@ check_kubernetes_specific() {
     )
 
     # Container fields
+    # shellcheck disable=SC2034  # Dictionary for future validation features
     local -A k8s_container_fields=(
         ["name"]="container"
         ["image"]="container"
@@ -717,6 +721,7 @@ check_kubernetes_specific() {
     )
 
     # Deckhouse-specific fields
+    # shellcheck disable=SC2034  # Dictionary for future validation features
     local -A deckhouse_fields=(
         ["deckhouse"]="top"
         ["nodeManager"]="deckhouse"
