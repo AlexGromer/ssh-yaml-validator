@@ -603,7 +603,7 @@ check_base64_in_secrets() {
     local line_num=0
     local errors=()
     local in_data_section=0
-    local is_secret=0
+    local is_secret_kind=0
     local data_indent=0
 
     while IFS= read -r line || [[ -n "$line" ]]; do
@@ -611,11 +611,11 @@ check_base64_in_secrets() {
 
         # Detect if this is a Secret
         if [[ "$line" =~ ^kind:[[:space:]]*Secret[[:space:]]*$ ]]; then
-            is_secret=1
+            is_secret_kind=1
         fi
 
         # Detect data: section in Secret
-        if [[ $is_secret -eq 1 ]] && [[ "$line" =~ ^data:[[:space:]]*$ ]]; then
+        if [[ $is_secret_kind -eq 1 ]] && [[ "$line" =~ ^data:[[:space:]]*$ ]]; then
             in_data_section=1
             data_indent=0
             continue
