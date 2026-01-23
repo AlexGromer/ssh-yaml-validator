@@ -205,7 +205,8 @@ check_duplicate_keys() {
     local file="$1"
     local line_num=0
     local errors=()
-    declare -A keys_by_indent
+    declare -A keys_by_level
+    local prev_indent=0
 
     while IFS= read -r line || [[ -n "$line" ]]; do
         ((line_num++))
@@ -214,6 +215,22 @@ check_duplicate_keys() {
         [[ "$line" =~ ^[[:space:]]*# ]] && continue
         [[ "$line" =~ ^[[:space:]]*$ ]] && continue
         [[ "$line" =~ ^---$ || "$line" =~ ^\.\.\.$ ]] && continue
+
+        # Detect list items (- key:) - they create new scope
+        if [[ "$line" =~ ^([[:space:]]*)-[[:space:]] ]]; then
+            local list_indent="${BASH_REMATCH[1]}"
+            local list_indent_level=${#list_indent}
+
+            # Clear keys from this level and deeper (new list item = new scope)
+            for level_key in "${!keys_by_level[@]}"; do
+                local stored_level="${level_key%%_*}"
+                if (( stored_level >= list_indent_level )); then
+                    unset "keys_by_level[$level_key]"
+                fi
+            done
+            prev_indent=$list_indent_level
+            continue
+        fi
 
         # Extract key and indent level
         if [[ "$line" =~ ^([[:space:]]*)([^:[:space:]]+|\"[^\"]+\"):[[:space:]] ]]; then
@@ -224,19 +241,29 @@ check_duplicate_keys() {
             # Remove quotes from key if present
             key="${key//\"/}"
 
-            # Skip list items (lines starting with -)
-            [[ "$key" =~ ^- ]] && continue
+            # When indent decreases or stays same, clear keys from equal/deeper levels
+            # (scope exit or sibling key like requests → limits)
+            if (( indent_level <= prev_indent )); then
+                for level_key in "${!keys_by_level[@]}"; do
+                    local stored_level="${level_key%%_*}"
+                    if (( stored_level >= indent_level )); then
+                        unset "keys_by_level[$level_key]"
+                    fi
+                done
+            fi
 
-            # Create unique identifier for this indent level
+            # Create unique identifier for this indent level + key
             local level_key="${indent_level}_${key}"
 
-            if [[ -n "${keys_by_indent[$level_key]}" ]]; then
+            if [[ -n "${keys_by_level[$level_key]}" ]]; then
                 errors+=("Строка $line_num: Дубликат ключа '$key' на уровне отступа $indent_level")
-                errors+=("  Первое определение: строка ${keys_by_indent[$level_key]}")
+                errors+=("  Первое определение: строка ${keys_by_level[$level_key]}")
                 errors+=("  Содержимое: ${line}")
             else
-                keys_by_indent[$level_key]=$line_num
+                keys_by_level[$level_key]=$line_num
             fi
+
+            prev_indent=$indent_level
         fi
     done < "$file"
 
@@ -501,6 +528,9 @@ check_label_format() {
             local label_key="${BASH_REMATCH[1]}"
             label_key="${label_key#"${label_key%%[![:space:]]*}"}"
             label_key="${label_key%"${label_key##*[![:space:]]}"}"
+
+            # Skip list items (- name:, - containerPort:, etc.)
+            [[ "$label_key" =~ ^- ]] && continue
 
             # Kubernetes label name rules:
             # - Max 63 characters
