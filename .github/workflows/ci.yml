@@ -2,6 +2,7 @@ name: CI - YAML Validator Tests
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened]
     branches: [ main ]
     paths:
       - '**.sh'

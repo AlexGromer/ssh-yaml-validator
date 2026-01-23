@@ -47,9 +47,11 @@ jobs:
         id: ci-status
         if: steps.pr.outputs.result != 'null'
         uses: actions/github-script@v7
+        env:
+          PR_DATA: ${{ steps.pr.outputs.result }}
         with:
           script: |
-            const pr = JSON.parse('${{ steps.pr.outputs.result }}');
+            const pr = JSON.parse(process.env.PR_DATA);
 
             // Get all check runs for PR head SHA
             const { data: checkRuns } = await github.rest.checks.listForRef({
@@ -89,9 +91,11 @@ jobs:
           steps.pr.outputs.result != 'null' &&
           fromJSON(steps.ci-status.outputs.result).canMerge == true
         uses: actions/github-script@v7
+        env:
+          PR_DATA: ${{ steps.pr.outputs.result }}
         with:
           script: |
-            const pr = JSON.parse('${{ steps.pr.outputs.result }}');
+            const pr = JSON.parse(process.env.PR_DATA);
 
             try {
               // Merge the PR
@@ -128,9 +132,11 @@ jobs:
           steps.pr.outputs.result != 'null' &&
           fromJSON(steps.ci-status.outputs.result).reason == 'pending_checks'
         uses: actions/github-script@v7
+        env:
+          PR_DATA: ${{ steps.pr.outputs.result }}
         with:
           script: |
-            const pr = JSON.parse('${{ steps.pr.outputs.result }}');
+            const pr = JSON.parse(process.env.PR_DATA);
 
             await github.rest.issues.createComment({
               owner: context.repo.owner,
