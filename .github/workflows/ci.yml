@@ -134,7 +134,8 @@ jobs:
       - name: Check for command injection vulnerabilities
         run: |
           # Check for unsafe eval or direct variable expansion in commands
-          if grep -E "eval.*\$|system.*\$|exec.*\$" *.sh 2>/dev/null; then
+          # Use word boundaries to avoid false positives (e.g., readOnlyRootFilesystem)
+          if grep -E '\beval\b.*\$|\bsystem\b.*\$|\bexec\b.*\$' *.sh 2>/dev/null; then
             echo "⚠️ WARNING: Potential command injection risk"
             exit 1
           fi

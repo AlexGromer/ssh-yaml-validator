@@ -15,9 +15,15 @@ spec:
       labels:
         app: myapp
     spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
       containers:
       - name: nginx
         image: nginx:1.21
+        securityContext:
+          readOnlyRootFilesystem: true
+          allowPrivilegeEscalation: false
         ports:
         - containerPort: 80
           protocol: TCP
