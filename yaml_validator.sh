@@ -3592,7 +3592,8 @@ check_implicit_types() {
         # NO (Norway), NO (number), Y (yes in some locales)
         if [[ "$line" =~ :[[:space:]]+(NO|No|no|Y|N)([[:space:]]|$|#) ]]; then
             local value="${BASH_REMATCH[1]}"
-            if [[ ! "$line" =~ :[[:space:]]+[\"\']$value[\"\'] ]]; then
+            # shellcheck disable=SC1087
+            if [[ ! "$line" =~ :[[:space:]]+[\"\']${value}[\"\'] ]]; then
                 case "$value" in
                     NO|No|no)
                         warnings+=("Строка $line_num: ПРЕДУПРЕЖДЕНИЕ: '$value' может быть интерпретирован как boolean false")
@@ -3609,7 +3610,8 @@ check_implicit_types() {
         # Check for scientific notation that might be unintended
         if [[ "$line" =~ :[[:space:]]+([0-9]+[eE][+-]?[0-9]+)([[:space:]]|$) ]]; then
             local value="${BASH_REMATCH[1]}"
-            if [[ ! "$line" =~ :[[:space:]]+[\"\']$value[\"\'] ]]; then
+            # shellcheck disable=SC1087
+            if [[ ! "$line" =~ :[[:space:]]+[\"\']${value}[\"\'] ]]; then
                 warnings+=("Строка $line_num: ПРЕДУПРЕЖДЕНИЕ: '$value' интерпретируется как научная нотация")
                 warnings+=("  Если это строка, используйте кавычки")
             fi
@@ -3639,9 +3641,6 @@ check_embedded_json() {
     local file="$1"
     local line_num=0
     local errors=()
-    local in_json_value=0
-    local json_start_line=0
-    local json_buffer=""
 
     while IFS= read -r line || [[ -n "$line" ]]; do
         ((line_num++))
