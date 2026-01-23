@@ -5,7 +5,7 @@
 # Pure bash implementation for Astra Linux SE 1.7 (Smolensk)
 # Purpose: Validate YAML files in Kubernetes clusters without external tools
 # Author: Generated for isolated environments
-# Version: 2.4.0
+# Version: 2.5.0
 # Updated: 2026-01-23
 #############################################################################
 
@@ -33,7 +33,7 @@ ERRORS_FOUND=()
 print_header() {
     echo -e "${BOLD}${CYAN}"
     echo "╔═══════════════════════════════════════════════════════════════════════╗"
-    echo "║                    YAML Validator v2.4.0                              ║"
+    echo "║                    YAML Validator v2.5.0                              ║"
     echo "║              Pure Bash Implementation for Air-Gapped Env              ║"
     echo "╚═══════════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
@@ -3413,6 +3413,379 @@ check_cronjob_schedule() {
     return 0
 }
 
+# NEW CHECK: Timestamp values that might be auto-converted by YAML parsers
+check_timestamp_values() {
+    local file="$1"
+    local line_num=0
+    local warnings=()
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Skip comments and empty lines
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "${line// }" ]] && continue
+
+        # Check for unquoted ISO8601-like dates (YYYY-MM-DD)
+        # These might be parsed as datetime objects instead of strings
+        if [[ "$line" =~ :[[:space:]]+([0-9]{4}-[0-9]{2}-[0-9]{2})([[:space:]]|$) ]]; then
+            local value="${BASH_REMATCH[1]}"
+            # Only warn if not already quoted
+            if [[ ! "$line" =~ :[[:space:]]+[\"\'][0-9]{4}-[0-9]{2}-[0-9]{2}[\"\'] ]]; then
+                warnings+=("Строка $line_num: ПРЕДУПРЕЖДЕНИЕ: Незакавыченная дата '$value' может быть преобразована в timestamp")
+                warnings+=("  Рекомендация: Используйте кавычки для сохранения строки: \"$value\"")
+            fi
+        fi
+
+        # Check for ISO8601 datetime format (YYYY-MM-DDTHH:MM:SS)
+        if [[ "$line" =~ :[[:space:]]+([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}) ]]; then
+            local value="${BASH_REMATCH[1]}"
+            if [[ ! "$line" =~ :[[:space:]]+[\"\'][0-9]{4}-[0-9]{2}-[0-9]{2}T ]]; then
+                warnings+=("Строка $line_num: ПРЕДУПРЕЖДЕНИЕ: Незакавыченный datetime '$value' будет преобразован парсером")
+                warnings+=("  Рекомендация: Если нужна строка, используйте кавычки")
+            fi
+        fi
+    done < "$file"
+
+    if [[ ${#warnings[@]} -gt 0 ]]; then
+        printf '%s\n' "${warnings[@]}"
+        return 1
+    fi
+    return 0
+}
+
+# NEW CHECK: Version numbers that might be parsed as floats
+check_version_numbers() {
+    local file="$1"
+    local line_num=0
+    local warnings=()
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Skip comments and empty lines
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "${line// }" ]] && continue
+
+        # Check for version-like fields with unquoted decimal numbers
+        # Examples: version: 1.0, version: 2.1, appVersion: 1.0
+        if [[ "$line" =~ ([vV]ersion|VERSION):[[:space:]]+([0-9]+\.[0-9]+)([[:space:]]|$) ]]; then
+            local field="${BASH_REMATCH[1]}"
+            local value="${BASH_REMATCH[2]}"
+            # Check if it's just X.Y (no third component) and unquoted
+            if [[ ! "$line" =~ $field:[[:space:]]+[\"\'] ]] && [[ ! "$value" =~ \.[0-9]+\. ]]; then
+                warnings+=("Строка $line_num: ПРЕДУПРЕЖДЕНИЕ: Версия '$value' может быть распознана как float")
+                warnings+=("  Примеры: 1.0 → 1, 1.10 → 1.1 (потеря precision)")
+                warnings+=("  Рекомендация: Используйте кавычки: \"$value\"")
+            fi
+        fi
+
+        # Check for chart version without quotes
+        if [[ "$line" =~ ^(appVersion|chartVersion):[[:space:]]+([0-9]+\.[0-9]+)([[:space:]]|$) ]]; then
+            local field="${BASH_REMATCH[1]}"
+            local value="${BASH_REMATCH[2]}"
+            if [[ ! "$line" =~ $field:[[:space:]]+[\"\'] ]]; then
+                warnings+=("Строка $line_num: ПРЕДУПРЕЖДЕНИЕ: $field '$value' должен быть в кавычках")
+            fi
+        fi
+    done < "$file"
+
+    if [[ ${#warnings[@]} -gt 0 ]]; then
+        printf '%s\n' "${warnings[@]}"
+        return 1
+    fi
+    return 0
+}
+
+# NEW CHECK: YAML merge keys (<<:) support and validation
+check_merge_keys() {
+    local file="$1"
+    local line_num=0
+    local errors=()
+    local declared_anchors=()
+
+    # First pass: collect all anchors
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" =~ \&([a-zA-Z_][a-zA-Z0-9_]*) ]]; then
+            declared_anchors+=("${BASH_REMATCH[1]}")
+        fi
+    done < "$file"
+
+    # Second pass: validate merge keys
+    line_num=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Check for merge key syntax
+        if [[ "$line" =~ \<\<:[[:space:]]+\*([a-zA-Z_][a-zA-Z0-9_]*) ]]; then
+            local alias="${BASH_REMATCH[1]}"
+            # Check if referenced anchor exists
+            local found=0
+            for anchor in "${declared_anchors[@]}"; do
+                if [[ "$anchor" == "$alias" ]]; then
+                    found=1
+                    break
+                fi
+            done
+            if [[ $found -eq 0 ]]; then
+                errors+=("Строка $line_num: Merge key ссылается на несуществующий anchor: '*$alias'")
+            fi
+        fi
+
+        # Check for invalid merge key syntax
+        if [[ "$line" =~ \<\<[[:space:]]*:[[:space:]]*[^\*] ]] && [[ ! "$line" =~ \<\<:[[:space:]]*$ ]]; then
+            if [[ ! "$line" =~ \<\<:[[:space:]]*\[ ]]; then
+                errors+=("Строка $line_num: Некорректный синтаксис merge key, ожидается alias (*name)")
+            fi
+        fi
+
+        # Check for merge with array of aliases (advanced syntax)
+        if [[ "$line" =~ \<\<:[[:space:]]*\[([^\]]+)\] ]]; then
+            local aliases_str="${BASH_REMATCH[1]}"
+            # Parse comma-separated aliases
+            IFS=',' read -ra alias_list <<< "$aliases_str"
+            for alias_entry in "${alias_list[@]}"; do
+                alias_entry="${alias_entry// /}"  # Trim spaces
+                if [[ "$alias_entry" =~ ^\*([a-zA-Z_][a-zA-Z0-9_]*) ]]; then
+                    local alias="${BASH_REMATCH[1]}"
+                    local found=0
+                    for anchor in "${declared_anchors[@]}"; do
+                        if [[ "$anchor" == "$alias" ]]; then
+                            found=1
+                            break
+                        fi
+                    done
+                    if [[ $found -eq 0 ]]; then
+                        errors+=("Строка $line_num: Merge key list содержит несуществующий anchor: '*$alias'")
+                    fi
+                fi
+            done
+        fi
+    done < "$file"
+
+    if [[ ${#errors[@]} -gt 0 ]]; then
+        printf '%s\n' "${errors[@]}"
+        return 1
+    fi
+    return 0
+}
+
+# NEW CHECK: Implicit type coercion warnings (extended)
+check_implicit_types() {
+    local file="$1"
+    local line_num=0
+    local warnings=()
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Skip comments and empty lines
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "${line// }" ]] && continue
+        # Skip multiline blocks (| or > indicators)
+        [[ "$line" == *": |"* ]] && continue
+        [[ "$line" == *": >"* ]] && continue
+        [[ "$line" == *":|"* ]] && continue
+        [[ "$line" == *":>"* ]] && continue
+
+        # Check for country codes that might be parsed as booleans (Norway problem extended)
+        # NO (Norway), NO (number), Y (yes in some locales)
+        if [[ "$line" =~ :[[:space:]]+(NO|No|no|Y|N)([[:space:]]|$|#) ]]; then
+            local value="${BASH_REMATCH[1]}"
+            # shellcheck disable=SC1087
+            if [[ ! "$line" =~ :[[:space:]]+[\"\']${value}[\"\'] ]]; then
+                case "$value" in
+                    NO|No|no)
+                        warnings+=("Строка $line_num: ПРЕДУПРЕЖДЕНИЕ: '$value' может быть интерпретирован как boolean false")
+                        warnings+=("  Если это код страны (Норвегия) или другое значение, используйте кавычки: \"$value\"")
+                        ;;
+                    Y|N)
+                        warnings+=("Строка $line_num: ПРЕДУПРЕЖДЕНИЕ: '$value' может быть интерпретирован как boolean")
+                        warnings+=("  Рекомендация: Используйте кавычки: \"$value\"")
+                        ;;
+                esac
+            fi
+        fi
+
+        # Check for scientific notation that might be unintended
+        if [[ "$line" =~ :[[:space:]]+([0-9]+[eE][+-]?[0-9]+)([[:space:]]|$) ]]; then
+            local value="${BASH_REMATCH[1]}"
+            # shellcheck disable=SC1087
+            if [[ ! "$line" =~ :[[:space:]]+[\"\']${value}[\"\'] ]]; then
+                warnings+=("Строка $line_num: ПРЕДУПРЕЖДЕНИЕ: '$value' интерпретируется как научная нотация")
+                warnings+=("  Если это строка, используйте кавычки")
+            fi
+        fi
+
+        # Check for infinity/nan values
+        if [[ "$line" =~ :[[:space:]]+(\.inf|\.Inf|\.INF|-\.inf|\.nan|\.NaN|\.NAN)([[:space:]]|$) ]]; then
+            local value="${BASH_REMATCH[1]}"
+            warnings+=("Строка $line_num: ИНФОРМАЦИЯ: '$value' - специальное значение YAML (infinity/NaN)")
+        fi
+
+        # Check for unquoted strings starting with special characters
+        if [[ "$line" == *": @"* ]]; then
+            warnings+=("Строка $line_num: ПРЕДУПРЕЖДЕНИЕ: Значение начинается с '@' - рекомендуется закавычить")
+        fi
+    done < "$file"
+
+    if [[ ${#warnings[@]} -gt 0 ]]; then
+        printf '%s\n' "${warnings[@]}"
+        return 1
+    fi
+    return 0
+}
+
+# NEW CHECK: Embedded JSON validation in YAML
+check_embedded_json() {
+    local file="$1"
+    local line_num=0
+    local errors=()
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Detect JSON-style inline values (single line)
+        if [[ "$line" =~ :[[:space:]]+(\{[^\}]+\})([[:space:]]|$) ]]; then
+            local json_val="${BASH_REMATCH[1]}"
+            # Basic JSON object validation
+            # Count braces
+            local open_braces="${json_val//[^\{]/}"
+            local close_braces="${json_val//[^\}]/}"
+            if [[ ${#open_braces} -ne ${#close_braces} ]]; then
+                errors+=("Строка $line_num: Несбалансированные фигурные скобки в inline JSON")
+            fi
+            # Check for common JSON errors
+            if [[ "$json_val" =~ ,[[:space:]]*\} ]]; then
+                errors+=("Строка $line_num: Trailing comma в JSON объекте")
+            fi
+        fi
+
+        # Detect JSON-style inline arrays
+        if [[ "$line" =~ :[[:space:]]+(\[[^\]]+\])([[:space:]]|$) ]]; then
+            local json_arr="${BASH_REMATCH[1]}"
+            local open_brackets="${json_arr//[^\[]/}"
+            local close_brackets="${json_arr//[^\]]/}"
+            if [[ ${#open_brackets} -ne ${#close_brackets} ]]; then
+                errors+=("Строка $line_num: Несбалансированные квадратные скобки в inline JSON array")
+            fi
+            if [[ "$json_arr" =~ ,[[:space:]]*\] ]]; then
+                errors+=("Строка $line_num: Trailing comma в JSON массиве")
+            fi
+        fi
+
+        # Check for JSON keys without quotes (common mistake when embedding JSON)
+        if [[ "$line" =~ \{[[:space:]]*([a-zA-Z_][a-zA-Z0-9_]*):[[:space:]] ]]; then
+            local key="${BASH_REMATCH[1]}"
+            # If it looks like JSON (has : after a word), but key is unquoted
+            if [[ "$line" =~ \{[^\"]*$key:[[:space:]] ]]; then
+                errors+=("Строка $line_num: JSON ключ '$key' должен быть в двойных кавычках")
+                errors+=("  Пример: {\"$key\": value}")
+            fi
+        fi
+    done < "$file"
+
+    if [[ ${#errors[@]} -gt 0 ]]; then
+        printf '%s\n' "${errors[@]}"
+        return 1
+    fi
+    return 0
+}
+
+# NEW CHECK: Networking and protocol values
+check_network_values() {
+    local file="$1"
+    local line_num=0
+    local errors=()
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Skip comments
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+
+        # Check protocol field (TCP, UDP, SCTP)
+        if [[ "$line" =~ protocol:[[:space:]]+([^[:space:]#]+) ]]; then
+            local proto="${BASH_REMATCH[1]}"
+            proto="${proto%\"}"
+            proto="${proto#\"}"
+            if [[ ! "$proto" =~ ^(TCP|UDP|SCTP)$ ]]; then
+                errors+=("Строка $line_num: Некорректный protocol: '$proto'")
+                errors+=("  Допустимо: TCP, UDP, SCTP")
+            fi
+        fi
+
+        # Check IP addresses format
+        if [[ "$line" =~ (clusterIP|loadBalancerIP|externalIP):[[:space:]]+([^[:space:]#]+) ]]; then
+            local field="${BASH_REMATCH[1]}"
+            local ip="${BASH_REMATCH[2]}"
+            ip="${ip%\"}"
+            ip="${ip#\"}"
+            # Skip special values
+            if [[ "$ip" != "None" ]] && [[ "$ip" != "\"\"" ]] && [[ -n "$ip" ]]; then
+                # Basic IPv4 validation
+                if [[ ! "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && [[ ! "$ip" =~ : ]]; then
+                    errors+=("Строка $line_num: Некорректный формат IP для $field: '$ip'")
+                fi
+            fi
+        fi
+
+        # Check for CIDR notation
+        if [[ "$line" =~ (cidr|CIDR|podCIDR|serviceCIDR):[[:space:]]+([^[:space:]#]+) ]]; then
+            local cidr="${BASH_REMATCH[2]}"
+            cidr="${cidr%\"}"
+            cidr="${cidr#\"}"
+            if [[ -n "$cidr" ]] && [[ ! "$cidr" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]]; then
+                errors+=("Строка $line_num: Некорректный CIDR формат: '$cidr'")
+                errors+=("  Ожидается: X.X.X.X/Y (например: 10.0.0.0/8)")
+            fi
+        fi
+    done < "$file"
+
+    if [[ ${#errors[@]} -gt 0 ]]; then
+        printf '%s\n' "${errors[@]}"
+        return 1
+    fi
+    return 0
+}
+
+# NEW CHECK: Key naming conventions
+check_key_naming() {
+    local file="$1"
+    local line_num=0
+    local warnings=()
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Skip comments and empty lines
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "${line// }" ]] && continue
+
+        # Extract key from "key: value" pattern
+        if [[ "$line" =~ ^([[:space:]]*)([a-zA-Z_][a-zA-Z0-9_-]*):[[:space:]] ]]; then
+            local indent="${BASH_REMATCH[1]}"
+            local key="${BASH_REMATCH[2]}"
+
+            # Check for keys with double underscores (often typos)
+            if [[ "$key" =~ __ ]]; then
+                warnings+=("Строка $line_num: ПРЕДУПРЕЖДЕНИЕ: Ключ '$key' содержит двойное подчёркивание")
+            fi
+
+            # Check for keys that start with numbers (valid YAML but unusual)
+            if [[ "$key" =~ ^[0-9] ]]; then
+                warnings+=("Строка $line_num: ПРЕДУПРЕЖДЕНИЕ: Ключ '$key' начинается с цифры")
+            fi
+        fi
+    done < "$file"
+
+    if [[ ${#warnings[@]} -gt 0 ]]; then
+        printf '%s\n' "${warnings[@]}"
+        return 1
+    fi
+    return 0
+}
+
 validate_yaml_file() {
     local file="$1"
     local verbose="$2"
@@ -3858,12 +4231,81 @@ validate_yaml_file() {
     fi
 
     if [[ $verbose -eq 1 ]]; then
-        echo -e "  ${CYAN}└─ Проверка CronJob schedule...${NC}"
+        echo -e "  ${CYAN}├─ Проверка CronJob schedule...${NC}"
     fi
     local cronjob_errors
     if ! cronjob_errors=$(check_cronjob_schedule "$file"); then
         file_errors+=("=== KUBERNETES: CRONJOB ===")
         file_errors+=("$cronjob_errors")
+    fi
+
+    # === NEW CHECKS v2.5.0 ===
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка timestamp/date values...${NC}"
+    fi
+    local timestamp_warnings
+    timestamp_warnings=$(check_timestamp_values "$file")
+    if [[ -n "$timestamp_warnings" ]]; then
+        file_errors+=("=== YAML: TIMESTAMP VALUES ===")
+        file_errors+=("$timestamp_warnings")
+    fi
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка version numbers...${NC}"
+    fi
+    local version_warnings
+    version_warnings=$(check_version_numbers "$file")
+    if [[ -n "$version_warnings" ]]; then
+        file_errors+=("=== YAML: VERSION NUMBERS ===")
+        file_errors+=("$version_warnings")
+    fi
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка merge keys (<<:)...${NC}"
+    fi
+    local merge_errors
+    if ! merge_errors=$(check_merge_keys "$file"); then
+        file_errors+=("=== YAML: MERGE KEYS ===")
+        file_errors+=("$merge_errors")
+    fi
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка implicit type coercion...${NC}"
+    fi
+    local implicit_warnings
+    implicit_warnings=$(check_implicit_types "$file")
+    if [[ -n "$implicit_warnings" ]]; then
+        file_errors+=("=== YAML: IMPLICIT TYPES ===")
+        file_errors+=("$implicit_warnings")
+    fi
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка embedded JSON...${NC}"
+    fi
+    local json_errors
+    if ! json_errors=$(check_embedded_json "$file"); then
+        file_errors+=("=== YAML: EMBEDDED JSON ===")
+        file_errors+=("$json_errors")
+    fi
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка network values...${NC}"
+    fi
+    local network_errors
+    if ! network_errors=$(check_network_values "$file"); then
+        file_errors+=("=== KUBERNETES: NETWORK VALUES ===")
+        file_errors+=("$network_errors")
+    fi
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}└─ Проверка key naming...${NC}"
+    fi
+    local naming_warnings
+    naming_warnings=$(check_key_naming "$file")
+    if [[ -n "$naming_warnings" ]]; then
+        file_errors+=("=== YAML: KEY NAMING ===")
+        file_errors+=("$naming_warnings")
     fi
 
     if [[ ${#file_errors[@]} -eq 0 ]]; then
