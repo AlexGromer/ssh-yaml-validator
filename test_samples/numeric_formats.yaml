@@ -1,0 +1,33 @@
+# Test: Numeric format edge cases
+# Should detect octal, hex, scientific notation
+apiVersion: v1
+kind: Pod
+metadata:
+  name: numeric-test
+spec:
+  containers:
+    - name: app
+      image: nginx
+      securityContext:
+        # Octal: 0644 = 420 decimal (common mistake!)
+        fsGroup: 0644
+        runAsUser: 1000
+        runAsGroup: 0755
+  volumes:
+    - name: config
+      configMap:
+        name: my-config
+        # This is octal 420, not decimal 644!
+        defaultMode: 0644
+---
+# Hexadecimal and scientific notation
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hex-test
+data:
+  hex_value: "0x1A3F"
+  scientific: "1.5e10"
+  infinity: ".inf"
+  negative_inf: "-.inf"
+  nan_value: ".nan"

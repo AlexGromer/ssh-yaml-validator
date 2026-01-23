@@ -1,0 +1,57 @@
+# Test: Multiline block indicators
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: multiline-test
+data:
+  # Literal block (preserves newlines)
+  script: |
+    #!/bin/bash
+    echo "Hello World"
+    exit 0
+
+  # Folded block (folds newlines to spaces)
+  description: >
+    This is a long description
+    that spans multiple lines
+    but will be folded into one.
+
+  # Literal with strip indicator (removes trailing newlines)
+  stripped: |-
+    No trailing newline here
+
+  # Literal with keep indicator (keeps trailing newlines)
+  kept: |+
+    Keep my trailing newlines
+
+
+  # Folded with explicit indent indicator
+  indented: >2
+      This has explicit
+      indentation indicator
+
+  # Invalid indent indicator (should warn)
+  bad_indent: |0
+    Zero indent is invalid
+
+  # Embedded JSON in multiline
+  json_config: |
+    {
+      "key": "value",
+      "nested": {
+        "array": [1, 2, 3]
+      }
+    }
+
+  # Embedded XML in multiline
+  xml_config: |
+    <?xml version="1.0"?>
+    <root>
+      <element>value</element>
+    </root>
+
+  # Base64 encoded content
+  certificate: |
+    LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSURYVENDQWtXZ0F3SUJB
+    Z0lKQUpDK0lYNUY5cHlHTUEwR0NTcUdTSWIzRFFFQkN3VUFNRVl4Q3pBSkJn
+    TlZCQVlUQWtGVk1STXdFUVlEVlFRSURBcFRiMjFsTFZOMFlYUmxNU0l3SUFZRAogLS0tLS1FTkQgQ0VSVElGSUNBVEUtLS0tLQo=

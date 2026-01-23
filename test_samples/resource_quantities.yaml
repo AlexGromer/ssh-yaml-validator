@@ -1,0 +1,42 @@
+# Test: Kubernetes resource quantities validation
+apiVersion: v1
+kind: Pod
+metadata:
+  name: resource-test
+spec:
+  containers:
+    - name: valid-resources
+      image: nginx
+      resources:
+        requests:
+          # Valid formats
+          memory: 128Mi
+          cpu: 500m
+        limits:
+          memory: 1Gi
+          cpu: "2"
+    - name: invalid-resources
+      image: redis
+      resources:
+        requests:
+          # Invalid: missing suffix for memory
+          memory: 128
+          # Invalid format
+          cpu: abc
+        limits:
+          # Invalid suffix
+          memory: 1GB
+          # Valid decimal
+          cpu: 0.5
+    - name: edge-case-resources
+      image: busybox
+      resources:
+        requests:
+          # Decimal suffixes
+          memory: 500M
+          cpu: 100m
+        limits:
+          # Binary suffixes
+          memory: 2Gi
+          # Millicores
+          cpu: 2000m

@@ -5,7 +5,7 @@
 # Pure bash implementation for Astra Linux SE 1.7 (Smolensk)
 # Purpose: Validate YAML files in Kubernetes clusters without external tools
 # Author: Generated for isolated environments
-# Version: 2.1.0
+# Version: 2.2.0
 #############################################################################
 
 set -o pipefail
@@ -32,7 +32,7 @@ ERRORS_FOUND=()
 print_header() {
     echo -e "${BOLD}${CYAN}"
     echo "╔═══════════════════════════════════════════════════════════════════════╗"
-    echo "║                    YAML Validator v2.1.0                              ║"
+    echo "║                    YAML Validator v2.2.0                              ║"
     echo "║              Pure Bash Implementation for Air-Gapped Env              ║"
     echo "╚═══════════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
@@ -598,6 +598,338 @@ check_anchors_aliases() {
     return 0
 }
 
+check_base64_in_secrets() {
+    local file="$1"
+    local line_num=0
+    local errors=()
+    local in_data_section=0
+    local is_secret=0
+    local data_indent=0
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Detect if this is a Secret
+        if [[ "$line" =~ ^kind:[[:space:]]*Secret[[:space:]]*$ ]]; then
+            is_secret=1
+        fi
+
+        # Detect data: section in Secret
+        if [[ $is_secret -eq 1 ]] && [[ "$line" =~ ^data:[[:space:]]*$ ]]; then
+            in_data_section=1
+            data_indent=0
+            continue
+        fi
+
+        # Track indent to know when we exit data section
+        if [[ $in_data_section -eq 1 ]]; then
+            local current_indent=0
+            if [[ "$line" =~ ^([[:space:]]*) ]]; then
+                current_indent=${#BASH_REMATCH[1]}
+            fi
+
+            # Exit data section on non-indented line
+            if [[ "$line" =~ ^[a-zA-Z] ]]; then
+                in_data_section=0
+                continue
+            fi
+
+            # Set data_indent on first data line
+            if [[ $data_indent -eq 0 ]] && [[ $current_indent -gt 0 ]]; then
+                data_indent=$current_indent
+            fi
+
+            # Validate base64 values in data section
+            if [[ "$line" =~ ^[[:space:]]+([^:]+):[[:space:]]+(.+)$ ]]; then
+                local key="${BASH_REMATCH[1]}"
+                local value="${BASH_REMATCH[2]}"
+
+                # Trim whitespace
+                key="${key#"${key%%[![:space:]]*}"}"
+                value="${value#"${value%%[![:space:]]*}"}"
+                value="${value%"${value##*[![:space:]]}"}"
+
+                # Skip if empty or quoted (stringData uses plain text)
+                [[ -z "$value" ]] && continue
+                [[ "$value" =~ ^[\"\'] ]] && continue
+
+                # Check if it looks like base64 (alphanumeric + / + = padding)
+                if [[ ! "$value" =~ ^[A-Za-z0-9+/]*=*$ ]]; then
+                    errors+=("Строка $line_num: Secret.data '$key' содержит невалидный base64")
+                    errors+=("  Значение: $value")
+                    errors+=("  Рекомендация: Используйте 'stringData' для незакодированных значений")
+                fi
+
+                # Check base64 padding
+                local len=${#value}
+                local mod=$((len % 4))
+                if [[ $mod -eq 1 ]]; then
+                    errors+=("Строка $line_num: Secret.data '$key' имеет некорректную длину base64")
+                    errors+=("  Длина $len не кратна 4 (mod=$mod)")
+                fi
+            fi
+        fi
+    done < "$file"
+
+    if [[ ${#errors[@]} -gt 0 ]]; then
+        printf '%s\n' "${errors[@]}"
+        return 1
+    fi
+    return 0
+}
+
+check_numeric_formats() {
+    local file="$1"
+    local line_num=0
+    local info=()
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Skip comments
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+
+        # Check for octal numbers (common mistake with file permissions)
+        # mode: 0644 is octal (420), mode: 644 is decimal (644)
+        # This is INFO only - octal is valid, just informing user
+        if [[ "$line" =~ (mode|defaultMode|fsGroup|runAsUser|runAsGroup):[[:space:]]+0([0-7]+)[[:space:]]*$ ]]; then
+            local field="${BASH_REMATCH[1]}"
+            local octal_value="0${BASH_REMATCH[2]}"
+            # Convert octal to decimal for info
+            local decimal_value=$((8#${BASH_REMATCH[2]}))
+            info+=("Строка $line_num: ИНФОРМАЦИЯ: '$field: $octal_value' это octal (=$decimal_value в десятичной)")
+            info+=("  Если нужен decimal 644, уберите ведущий 0")
+        fi
+
+        # Check for hexadecimal values (may be unintentional) - INFO only
+        if [[ "$line" =~ :[[:space:]]+0x[0-9A-Fa-f]+[[:space:]]*$ ]]; then
+            info+=("Строка $line_num: ИНФОРМАЦИЯ: Обнаружено hex число в значении")
+            info+=("  Содержимое: ${line}")
+        fi
+
+        # Check for scientific notation (may be unintentional string) - INFO only
+        if [[ "$line" =~ :[[:space:]]+[0-9]+[eE][+-]?[0-9]+[[:space:]]*$ ]]; then
+            info+=("Строка $line_num: ИНФОРМАЦИЯ: Обнаружена научная нотация")
+            info+=("  Содержимое: ${line}")
+            info+=("  Если нужна строка, заключите в кавычки")
+        fi
+
+        # Check for infinity/NaN - INFO only
+        if [[ "$line" =~ :[[:space:]]+(\.inf|-\.inf|\.nan|\.Inf|-\.Inf|\.NaN)[[:space:]]*$ ]]; then
+            info+=("Строка $line_num: ИНФОРМАЦИЯ: Специальное числовое значение '${BASH_REMATCH[1]}'")
+            info+=("  Содержимое: ${line}")
+        fi
+    done < "$file"
+
+    # These are all informational - output but don't fail
+    if [[ ${#info[@]} -gt 0 ]]; then
+        printf '%s\n' "${info[@]}"
+    fi
+
+    # Always return 0 - these are just informational notices
+    return 0
+}
+
+check_resource_quantities() {
+    local file="$1"
+    local line_num=0
+    local errors=()
+    local in_resources=0
+    local resource_indent=0
+
+    # Valid K8s resource quantity suffixes
+    # Binary: Ki, Mi, Gi, Ti, Pi, Ei
+    # Decimal: n, u, m, k, M, G, T, P, E
+    local valid_suffixes="(Ki|Mi|Gi|Ti|Pi|Ei|n|u|m|k|M|G|T|P|E)"
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Skip comments
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+
+        # Detect resources: section
+        if [[ "$line" =~ ^([[:space:]]*)resources:[[:space:]]*$ ]]; then
+            in_resources=1
+            resource_indent=${#BASH_REMATCH[1]}
+            continue
+        fi
+
+        # Track if we're still in resources section
+        if [[ $in_resources -eq 1 ]]; then
+            local current_indent=0
+            if [[ "$line" =~ ^([[:space:]]*)[^[:space:]] ]]; then
+                current_indent=${#BASH_REMATCH[1]}
+            fi
+
+            # Exit resources if indent goes back to or before resources level
+            if [[ $current_indent -le $resource_indent ]] && [[ "$line" =~ ^[[:space:]]*[a-zA-Z] ]]; then
+                in_resources=0
+            fi
+        fi
+
+        # Validate memory/cpu quantities
+        if [[ "$line" =~ (memory|cpu|storage|ephemeral-storage):[[:space:]]+([^[:space:]]+) ]]; then
+            local resource_type="${BASH_REMATCH[1]}"
+            local value="${BASH_REMATCH[2]}"
+
+            # Remove quotes if present
+            value="${value//\"/}"
+            value="${value//\'/}"
+
+            # Skip if empty
+            [[ -z "$value" ]] && continue
+
+            # Memory/storage should have quantity suffix
+            if [[ "$resource_type" =~ ^(memory|storage|ephemeral-storage)$ ]]; then
+                if [[ ! "$value" =~ ^[0-9]+${valid_suffixes}?$ ]]; then
+                    errors+=("Строка $line_num: Возможно некорректный формат $resource_type: '$value'")
+                    errors+=("  Допустимые суффиксы: Ki, Mi, Gi, Ti (binary) или k, M, G, T (decimal)")
+                    errors+=("  Примеры: 128Mi, 1Gi, 500M")
+                fi
+            fi
+
+            # CPU can be decimal (0.5) or millicores (500m)
+            if [[ "$resource_type" == "cpu" ]]; then
+                if [[ ! "$value" =~ ^[0-9]+(\.[0-9]+)?m?$ ]] && [[ ! "$value" =~ ^[0-9]+$ ]]; then
+                    errors+=("Строка $line_num: Возможно некорректный формат cpu: '$value'")
+                    errors+=("  Допустимые форматы: 0.5, 1, 500m, 2000m")
+                fi
+            fi
+        fi
+    done < "$file"
+
+    if [[ ${#errors[@]} -gt 0 ]]; then
+        printf '%s\n' "${errors[@]}"
+        return 1
+    fi
+    return 0
+}
+
+check_port_ranges() {
+    local file="$1"
+    local line_num=0
+    local errors=()
+    local info=()
+    local has_errors=0
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Skip comments
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+
+        # Check port fields
+        if [[ "$line" =~ (containerPort|hostPort|port|targetPort|nodePort):[[:space:]]+([0-9]+) ]]; then
+            local port_type="${BASH_REMATCH[1]}"
+            local port_value="${BASH_REMATCH[2]}"
+
+            # Validate port range 1-65535
+            if [[ $port_value -lt 1 ]] || [[ $port_value -gt 65535 ]]; then
+                errors+=("Строка $line_num: Порт '$port_type: $port_value' вне допустимого диапазона (1-65535)")
+                errors+=("  Содержимое: ${line}")
+                has_errors=1
+            fi
+
+            # NodePort range is typically 30000-32767 (warning, not error)
+            if [[ "$port_type" == "nodePort" ]]; then
+                if [[ $port_value -lt 30000 ]] || [[ $port_value -gt 32767 ]]; then
+                    info+=("Строка $line_num: ПРЕДУПРЕЖДЕНИЕ: nodePort $port_value вне стандартного диапазона (30000-32767)")
+                fi
+            fi
+
+            # Privileged ports (info only, not error)
+            if [[ $port_value -lt 1024 ]] && [[ "$port_type" =~ ^(containerPort|hostPort)$ ]]; then
+                info+=("Строка $line_num: ИНФОРМАЦИЯ: Привилегированный порт $port_value (< 1024)")
+            fi
+        fi
+    done < "$file"
+
+    # Output all messages
+    if [[ ${#errors[@]} -gt 0 ]]; then
+        printf '%s\n' "${errors[@]}"
+    fi
+    if [[ ${#info[@]} -gt 0 ]]; then
+        printf '%s\n' "${info[@]}"
+    fi
+
+    # Only return 1 for actual errors, not for info/warnings
+    return $has_errors
+}
+
+check_multiline_blocks() {
+    local file="$1"
+    local line_num=0
+    local errors=()
+    local in_multiline=0
+    # shellcheck disable=SC2034  # Reserved for future detailed error reporting
+    local multiline_start=0
+    # shellcheck disable=SC2034  # Reserved for future block type validation
+    local multiline_type=""
+    local multiline_indent=0
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Skip empty lines in multiline
+        if [[ $in_multiline -eq 1 ]] && [[ -z "$line" ]]; then
+            continue
+        fi
+
+        # Detect multiline block start: key: | or key: > with optional indicators
+        # Indicators: |-, |+, |2, >-, >+, >2 etc.
+        if [[ "$line" =~ ^([[:space:]]*)([^:]+):[[:space:]]*([\|\>])([-+]?[0-9]*)([[:space:]]*#.*)?$ ]]; then
+            local indent="${BASH_REMATCH[1]}"
+            local key="${BASH_REMATCH[2]}"
+            local block_type="${BASH_REMATCH[3]}"
+            local indicator="${BASH_REMATCH[4]}"
+
+            in_multiline=1
+            # shellcheck disable=SC2034
+            multiline_start=$line_num
+            multiline_indent=${#indent}
+            # shellcheck disable=SC2034
+            multiline_type="$block_type$indicator"
+
+            # Info about block type
+            if [[ -n "$indicator" ]]; then
+                if [[ "$indicator" == "-" ]]; then
+                    # Strip final newlines - valid
+                    :
+                elif [[ "$indicator" == "+" ]]; then
+                    # Keep final newlines - valid
+                    :
+                elif [[ "$indicator" =~ ^[0-9]+$ ]]; then
+                    # Explicit indentation indicator
+                    if [[ $indicator -lt 1 ]] || [[ $indicator -gt 9 ]]; then
+                        errors+=("Строка $line_num: Некорректный индикатор отступа '$indicator' (должен быть 1-9)")
+                    fi
+                fi
+            fi
+            continue
+        fi
+
+        # Track multiline block exit
+        if [[ $in_multiline -eq 1 ]]; then
+            local current_indent=0
+            if [[ "$line" =~ ^([[:space:]]*)[^[:space:]] ]]; then
+                current_indent=${#BASH_REMATCH[1]}
+            fi
+
+            # Exit multiline when indent returns to base level
+            if [[ $current_indent -le $multiline_indent ]]; then
+                in_multiline=0
+            fi
+        fi
+    done < "$file"
+
+    if [[ ${#errors[@]} -gt 0 ]]; then
+        printf '%s\n' "${errors[@]}"
+        return 1
+    fi
+    return 0
+}
+
 check_kubernetes_specific() {
     local file="$1"
     local line_num=0
@@ -750,24 +1082,125 @@ check_kubernetes_specific() {
         ["tty"]="container"
     )
 
-    # Deckhouse-specific fields
+    # Deckhouse-specific fields - COMPLETE MODULE LIST
     # shellcheck disable=SC2034  # Dictionary for future validation features
     local -A deckhouse_fields=(
+        # Core modules
         ["deckhouse"]="top"
-        ["nodeManager"]="deckhouse"
-        ["prometheus"]="deckhouse"
-        ["userAuthn"]="deckhouse"
+        ["global"]="top"
+        ["common"]="top"
+        # Networking modules
+        ["cniCilium"]="deckhouse"
+        ["cniFlannel"]="deckhouse"
+        ["cniSimpleBridge"]="deckhouse"
+        ["istio"]="deckhouse"
+        ["metallb"]="deckhouse"
+        ["metallbCrd"]="deckhouse"
+        ["networkGateway"]="deckhouse"
+        ["networkPolicyEngine"]="deckhouse"
+        ["nodeLocalDns"]="deckhouse"
+        ["openvpn"]="deckhouse"
+        # Ingress modules
         ["ingressNginx"]="deckhouse"
-        ["certManager"]="deckhouse"
-        ["cloudProviderOpenstack"]="deckhouse"
+        ["nginxIngress"]="deckhouse"
+        # Monitoring modules
+        ["extendedMonitoring"]="deckhouse"
+        ["monitoringApplications"]="deckhouse"
+        ["monitoringCustom"]="deckhouse"
+        ["monitoringDeckhouse"]="deckhouse"
+        ["monitoringKubernetes"]="deckhouse"
+        ["monitoringKubernetesControlPlane"]="deckhouse"
+        ["okmeter"]="deckhouse"
+        ["operatorPrometheus"]="deckhouse"
+        ["prometheus"]="deckhouse"
+        ["prometheusMetricsAdapter"]="deckhouse"
+        ["verticalPodAutoscaler"]="deckhouse"
+        ["upmeter"]="deckhouse"
+        # Security modules
+        ["admissionPolicyEngine"]="deckhouse"
+        ["operatorTrivy"]="deckhouse"
+        ["runtimeAuditEngine"]="deckhouse"
+        ["userAuthn"]="deckhouse"
+        ["userAuthz"]="deckhouse"
+        # Storage modules
+        ["cephCsi"]="deckhouse"
+        ["localPathProvisioner"]="deckhouse"
+        ["linstor"]="deckhouse"
+        ["nfsSubdirExternalProvisioner"]="deckhouse"
+        ["snapshotController"]="deckhouse"
+        ["sdsDrbd"]="deckhouse"
+        ["sdsLocalVolume"]="deckhouse"
+        ["sdsReplicatedVolume"]="deckhouse"
+        ["sdsNodeConfigurator"]="deckhouse"
+        # Cloud Provider modules
         ["cloudProviderAws"]="deckhouse"
         ["cloudProviderAzure"]="deckhouse"
         ["cloudProviderGcp"]="deckhouse"
+        ["cloudProviderOpenstack"]="deckhouse"
         ["cloudProviderVsphere"]="deckhouse"
         ["cloudProviderYandex"]="deckhouse"
+        ["cloudProviderVcd"]="deckhouse"
+        ["cloudProviderZvirt"]="deckhouse"
+        # Cluster Management modules
+        ["nodeManager"]="deckhouse"
+        ["controlPlaneManager"]="deckhouse"
+        ["multitenancyManager"]="deckhouse"
+        ["deckhouseController"]="deckhouse"
+        ["terraformManager"]="deckhouse"
+        ["staticRoutingManager"]="deckhouse"
+        # Application modules
+        ["certManager"]="deckhouse"
+        ["dashboard"]="deckhouse"
+        ["descheduler"]="deckhouse"
+        ["flantIntegration"]="deckhouse"
+        ["helm"]="deckhouse"
+        ["keepalived"]="deckhouse"
+        ["logShipper"]="deckhouse"
+        ["namespaceConfigurator"]="deckhouse"
+        ["podReloader"]="deckhouse"
+        ["priorityClass"]="deckhouse"
+        ["registrypackages"]="deckhouse"
+        ["virtualization"]="deckhouse"
+        # Legacy / deprecated (for backwards compat)
         ["nodeGroup"]="deckhouse"
         ["chaos"]="deckhouse"
         ["monitoring"]="deckhouse"
+    )
+
+    # Deckhouse CRD kinds
+    # shellcheck disable=SC2034  # Dictionary for CRD validation
+    local -A deckhouse_crds=(
+        ["DeckhouseRelease"]="deckhouse.io"
+        ["ModuleConfig"]="deckhouse.io"
+        ["ModuleSource"]="deckhouse.io"
+        ["ModuleUpdatePolicy"]="deckhouse.io"
+        ["ModuleDocumentation"]="deckhouse.io"
+        ["ModuleRelease"]="deckhouse.io"
+        ["NodeGroup"]="deckhouse.io"
+        ["NodeGroupConfiguration"]="deckhouse.io"
+        ["SSHCredentials"]="deckhouse.io"
+        ["StaticInstance"]="deckhouse.io"
+        ["IngressNginxController"]="deckhouse.io"
+        ["DexAuthenticator"]="deckhouse.io"
+        ["DexProvider"]="deckhouse.io"
+        ["DexClient"]="deckhouse.io"
+        ["ClusterAuthorizationRule"]="deckhouse.io"
+        ["User"]="deckhouse.io"
+        ["Group"]="deckhouse.io"
+        ["ClusterLogDestination"]="deckhouse.io"
+        ["PodLogDestination"]="deckhouse.io"
+        ["ClusterLoggingConfig"]="deckhouse.io"
+        ["GrafanaAlertsChannel"]="deckhouse.io"
+        ["CustomAlertManager"]="deckhouse.io"
+        ["KeepalivedInstance"]="deckhouse.io"
+        ["PrometheusRemoteWrite"]="deckhouse.io"
+        ["CustomPrometheusRules"]="deckhouse.io"
+        ["VirtualMachine"]="deckhouse.io"
+        ["VirtualMachineIPAddressClaim"]="deckhouse.io"
+        ["VirtualMachineBlockDeviceAttachment"]="deckhouse.io"
+        ["VirtualDisk"]="deckhouse.io"
+        ["VirtualImage"]="deckhouse.io"
+        ["ClusterVirtualImage"]="deckhouse.io"
     )
 
     # Common typos (snake_case -> camelCase)
@@ -1017,12 +1450,57 @@ validate_yaml_file() {
     fi
 
     if [[ $verbose -eq 1 ]]; then
-        echo -e "  ${CYAN}└─ Проверка Kubernetes полей и опечаток...${NC}"
+        echo -e "  ${CYAN}├─ Проверка Kubernetes полей и опечаток...${NC}"
     fi
     local k8s_errors
     if ! k8s_errors=$(check_kubernetes_specific "$file"); then
         file_errors+=("=== KUBERNETES: РАСШИРЕННАЯ ПРОВЕРКА ===")
         file_errors+=("$k8s_errors")
+    fi
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка base64 в Secrets...${NC}"
+    fi
+    local base64_errors
+    if ! base64_errors=$(check_base64_in_secrets "$file"); then
+        file_errors+=("=== KUBERNETES: ВАЛИДАЦИЯ BASE64 ===")
+        file_errors+=("$base64_errors")
+    fi
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка числовых форматов (octal, hex)...${NC}"
+    fi
+    local numeric_errors
+    if ! numeric_errors=$(check_numeric_formats "$file"); then
+        file_errors+=("=== ИНФОРМАЦИЯ: ЧИСЛОВЫЕ ФОРМАТЫ ===")
+        file_errors+=("$numeric_errors")
+    fi
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка resource quantities (cpu, memory)...${NC}"
+    fi
+    local resource_errors
+    if ! resource_errors=$(check_resource_quantities "$file"); then
+        file_errors+=("=== KUBERNETES: RESOURCE QUANTITIES ===")
+        file_errors+=("$resource_errors")
+    fi
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка диапазонов портов...${NC}"
+    fi
+    local port_errors
+    if ! port_errors=$(check_port_ranges "$file"); then
+        file_errors+=("=== KUBERNETES: ВАЛИДАЦИЯ ПОРТОВ ===")
+        file_errors+=("$port_errors")
+    fi
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}└─ Проверка multiline блоков (|, >)...${NC}"
+    fi
+    local multiline_errors
+    if ! multiline_errors=$(check_multiline_blocks "$file"); then
+        file_errors+=("=== YAML: MULTILINE БЛОКИ ===")
+        file_errors+=("$multiline_errors")
     fi
 
     if [[ ${#file_errors[@]} -eq 0 ]]; then

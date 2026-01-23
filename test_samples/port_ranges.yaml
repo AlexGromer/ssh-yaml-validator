@@ -1,0 +1,42 @@
+# Test: Port range validation
+apiVersion: v1
+kind: Service
+metadata:
+  name: port-test
+spec:
+  type: NodePort
+  ports:
+    # Valid ports
+    - name: http
+      port: 80
+      targetPort: 8080
+      nodePort: 30080
+    # Invalid: port out of range
+    - name: invalid-port
+      port: 70000
+      targetPort: 99999
+    # Warning: nodePort outside standard range
+    - name: custom-nodeport
+      port: 443
+      nodePort: 25000
+    # Info: privileged port
+    - name: privileged
+      port: 22
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: container-ports
+spec:
+  containers:
+    - name: app
+      image: nginx
+      ports:
+        # Valid
+        - containerPort: 8080
+        # Privileged (info)
+        - containerPort: 443
+        # Invalid: zero
+        - containerPort: 0
+        # Invalid: negative (will be caught as syntax)
+        - containerPort: 65536
