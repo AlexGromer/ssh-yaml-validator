@@ -5,7 +5,7 @@
 # Pure bash implementation for Astra Linux SE 1.7 (Smolensk)
 # Purpose: Validate YAML files in Kubernetes clusters without external tools
 # Author: Generated for isolated environments
-# Version: 2.2.0
+# Version: 2.3.0
 #############################################################################
 
 set -o pipefail
@@ -32,7 +32,7 @@ ERRORS_FOUND=()
 print_header() {
     echo -e "${BOLD}${CYAN}"
     echo "╔═══════════════════════════════════════════════════════════════════════╗"
-    echo "║                    YAML Validator v2.2.0                              ║"
+    echo "║                    YAML Validator v2.3.0                              ║"
     echo "║              Pure Bash Implementation for Air-Gapped Env              ║"
     echo "╚═══════════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
@@ -930,6 +930,912 @@ check_multiline_blocks() {
     return 0
 }
 
+check_sexagesimal() {
+    local file="$1"
+    local line_num=0
+    local warnings=()
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Skip comments and empty lines
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "$line" ]] && continue
+
+        # Skip multiline blocks
+        [[ "$line" =~ :[[:space:]]*[\|\>] ]] && continue
+
+        # Detect sexagesimal patterns: XX:YY or XX:YY:ZZ (YAML 1.1 parses as base-60)
+        # But skip if it looks like a port mapping (80:80) or time with quotes
+        if [[ "$line" =~ :[[:space:]]+([0-9]{1,2}):([0-9]{2})(:[0-9]{2})?[[:space:]]*$ ]]; then
+            local value="${BASH_REMATCH[0]}"
+            # Skip if quoted
+            [[ "$line" =~ :[[:space:]]+[\"\'] ]] && continue
+
+            warnings+=("Строка $line_num: ПРЕДУПРЕЖДЕНИЕ: '$value' интерпретируется как sexagesimal (base-60) в YAML 1.1")
+            warnings+=("  Содержимое: ${line}")
+            warnings+=("  21:00 = $((21*60)), 1:30:00 = $((1*3600 + 30*60))")
+            warnings+=("  Рекомендация: Заключите в кавычки \"21:00\" если нужна строка")
+        fi
+    done < "$file"
+
+    if [[ ${#warnings[@]} -gt 0 ]]; then
+        printf '%s\n' "${warnings[@]}"
+    fi
+    return 0
+}
+
+check_extended_norway() {
+    local file="$1"
+    local line_num=0
+    local warnings=()
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Skip comments
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+
+        # Extended boolean-like values in YAML 1.1
+        # y, Y, n, N are also booleans!
+        if [[ "$line" =~ :[[:space:]]+(y|Y)[[:space:]]*$ ]]; then
+            warnings+=("Строка $line_num: ПРЕДУПРЕЖДЕНИЕ: 'y/Y' = true в YAML 1.1 (Norway Problem)")
+            warnings+=("  Содержимое: ${line}")
+            warnings+=("  Рекомендация: Используйте 'true' или закавычьте \"y\"")
+        fi
+
+        if [[ "$line" =~ :[[:space:]]+(n|N)[[:space:]]*$ ]]; then
+            warnings+=("Строка $line_num: ПРЕДУПРЕЖДЕНИЕ: 'n/N' = false в YAML 1.1 (Norway Problem)")
+            warnings+=("  Содержимое: ${line}")
+            warnings+=("  Рекомендация: Используйте 'false' или закавычьте \"n\"")
+        fi
+
+        # Country codes that could be misinterpreted
+        # NO (Norway), DE, FR are fine, but NO specifically is problematic
+        if [[ "$line" =~ :[[:space:]]+(NO|No)[[:space:]]*$ ]]; then
+            warnings+=("Строка $line_num: ПРЕДУПРЕЖДЕНИЕ: 'NO' = false в YAML 1.1 (Norway Problem)")
+            warnings+=("  Содержимое: ${line}")
+            warnings+=("  Если это код страны Норвегии, закавычьте: \"NO\"")
+        fi
+    done < "$file"
+
+    if [[ ${#warnings[@]} -gt 0 ]]; then
+        printf '%s\n' "${warnings[@]}"
+    fi
+    return 0
+}
+
+check_yaml_bomb() {
+    local file="$1"
+    local errors=()
+    declare -A anchor_refs
+    # shellcheck disable=SC2034  # Reserved for future deep recursion check
+    local max_depth=5
+    local max_refs=10
+
+    # Count anchor definitions and alias references
+    local anchor_count=0
+    local alias_count=0
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        # Count anchors
+        if [[ "$line" =~ \&([a-zA-Z0-9_-]+) ]]; then
+            ((anchor_count++))
+            local anchor="${BASH_REMATCH[1]}"
+            anchor_refs[$anchor]=0
+        fi
+
+        # Count references to each anchor
+        if [[ "$line" =~ \*([a-zA-Z0-9_-]+) ]]; then
+            ((alias_count++))
+            local alias="${BASH_REMATCH[1]}"
+            if [[ -n "${anchor_refs[$alias]}" ]]; then
+                ((anchor_refs[$alias]++))
+            fi
+        fi
+    done < "$file"
+
+    # Check for suspicious patterns
+    # 1. Many aliases referencing same anchor (potential quadratic blowup)
+    for anchor in "${!anchor_refs[@]}"; do
+        if [[ ${anchor_refs[$anchor]} -gt $max_refs ]]; then
+            errors+=("БЕЗОПАСНОСТЬ: Anchor '&$anchor' используется ${anchor_refs[$anchor]} раз (возможна YAML bomb)")
+            errors+=("  Риск: Quadratic blowup attack (CVE-2019-11253)")
+            errors+=("  Лимит: максимум $max_refs ссылок на один anchor")
+        fi
+    done
+
+    # 2. Too many anchors (potential exponential expansion)
+    if [[ $anchor_count -gt 20 ]]; then
+        errors+=("БЕЗОПАСНОСТЬ: Обнаружено $anchor_count anchors (возможна Billion Laughs attack)")
+        errors+=("  Рекомендация: Уменьшите количество anchors или проверьте файл вручную")
+    fi
+
+    # 3. High ratio of aliases to anchors (suspicious)
+    if [[ $anchor_count -gt 0 ]] && [[ $alias_count -gt $((anchor_count * 10)) ]]; then
+        errors+=("БЕЗОПАСНОСТЬ: Подозрительное соотношение aliases/anchors: $alias_count/$anchor_count")
+        errors+=("  Риск: Возможная атака на расширение памяти")
+    fi
+
+    if [[ ${#errors[@]} -gt 0 ]]; then
+        printf '%s\n' "${errors[@]}"
+        return 1
+    fi
+    return 0
+}
+
+check_string_quoting() {
+    local file="$1"
+    local line_num=0
+    local warnings=()
+
+    # Characters that require quoting at start of value
+    local special_start='[@{}\[\]*&!|>%#`]'
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Skip comments and empty lines
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "$line" ]] && continue
+
+        # Skip multiline blocks
+        [[ "$line" =~ :[[:space:]]*[\|\>] ]] && continue
+
+        # Check for unquoted values starting with special characters
+        if [[ "$line" =~ :[[:space:]]+($special_start) ]]; then
+            local char="${BASH_REMATCH[1]}"
+            # Skip if already quoted
+            [[ "$line" =~ :[[:space:]]+[\"\'] ]] && continue
+
+            warnings+=("Строка $line_num: ПРЕДУПРЕЖДЕНИЕ: Значение начинается с '$char' — требуются кавычки")
+            warnings+=("  Содержимое: ${line}")
+        fi
+
+        # Check for values that look like version numbers (1.0, 2.1.0)
+        if [[ "$line" =~ :[[:space:]]+([0-9]+\.[0-9]+(\.[0-9]+)?)[[:space:]]*$ ]]; then
+            local version="${BASH_REMATCH[1]}"
+            # Skip if in known numeric contexts
+            [[ "$line" =~ (apiVersion|version):[[:space:]] ]] && continue
+            # Skip if already quoted
+            [[ "$line" =~ :[[:space:]]+[\"\'] ]] && continue
+
+            warnings+=("Строка $line_num: ИНФОРМАЦИЯ: '$version' может быть распарсен как float")
+            warnings+=("  Если это версия, рекомендуется закавычить: \"$version\"")
+        fi
+
+        # Check for values containing ": " (colon-space) which breaks YAML
+        if [[ "$line" =~ :[[:space:]]+[^\"\'][^:]*:[[:space:]] ]]; then
+            # Skip if it's a nested key
+            [[ "$line" =~ ^[[:space:]]+[a-zA-Z] ]] && continue
+            warnings+=("Строка $line_num: ПРЕДУПРЕЖДЕНИЕ: Значение содержит ': ' — может сломать парсинг")
+            warnings+=("  Содержимое: ${line}")
+        fi
+    done < "$file"
+
+    if [[ ${#warnings[@]} -gt 0 ]]; then
+        printf '%s\n' "${warnings[@]}"
+    fi
+    return 0
+}
+
+check_image_pull_policy() {
+    local file="$1"
+    local line_num=0
+    local errors=()
+
+    # Valid values (case-sensitive!)
+    local valid_policies="Always|IfNotPresent|Never"
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Check imagePullPolicy field
+        if [[ "$line" =~ imagePullPolicy:[[:space:]]+([^[:space:]#]+) ]]; then
+            local policy="${BASH_REMATCH[1]}"
+            # Remove quotes if present
+            policy="${policy//\"/}"
+            policy="${policy//\'/}"
+
+            if [[ ! "$policy" =~ ^($valid_policies)$ ]]; then
+                errors+=("Строка $line_num: Некорректный imagePullPolicy: '$policy'")
+                errors+=("  Допустимые значения: Always, IfNotPresent, Never (case-sensitive!)")
+
+                # Suggest correction for common typos
+                case "${policy,,}" in
+                    always) errors+=("  Исправление: Always") ;;
+                    ifnotpresent) errors+=("  Исправление: IfNotPresent") ;;
+                    never) errors+=("  Исправление: Never") ;;
+                esac
+            fi
+        fi
+    done < "$file"
+
+    if [[ ${#errors[@]} -gt 0 ]]; then
+        printf '%s\n' "${errors[@]}"
+        return 1
+    fi
+    return 0
+}
+
+check_replicas_type() {
+    local file="$1"
+    local line_num=0
+    local errors=()
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Check replicas field - must be a number, not a string
+        if [[ "$line" =~ replicas:[[:space:]]+[\"\']([0-9]+)[\"\'] ]]; then
+            local value="${BASH_REMATCH[1]}"
+            errors+=("Строка $line_num: replicas должен быть числом, не строкой")
+            errors+=("  Найдено: replicas: \"$value\"")
+            errors+=("  Исправление: replicas: $value")
+        fi
+
+        # Check for non-numeric replicas
+        if [[ "$line" =~ replicas:[[:space:]]+([^[:space:]#]+) ]]; then
+            local value="${BASH_REMATCH[1]}"
+            # Skip if it's a valid number
+            [[ "$value" =~ ^[0-9]+$ ]] && continue
+            # Skip if it's quoted (caught above)
+            [[ "$value" =~ ^[\"\'] ]] && continue
+
+            errors+=("Строка $line_num: replicas должен быть положительным целым числом")
+            errors+=("  Найдено: replicas: $value")
+        fi
+
+        # Same for minReplicas, maxReplicas
+        if [[ "$line" =~ (minReplicas|maxReplicas):[[:space:]]+[\"\']([0-9]+)[\"\'] ]]; then
+            local field="${BASH_REMATCH[1]}"
+            local value="${BASH_REMATCH[2]}"
+            errors+=("Строка $line_num: $field должен быть числом, не строкой")
+            errors+=("  Исправление: $field: $value")
+        fi
+    done < "$file"
+
+    if [[ ${#errors[@]} -gt 0 ]]; then
+        printf '%s\n' "${errors[@]}"
+        return 1
+    fi
+    return 0
+}
+
+check_image_tags() {
+    local file="$1"
+    local line_num=0
+    local warnings=()
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Check image field
+        if [[ "$line" =~ image:[[:space:]]+([^[:space:]#]+) ]]; then
+            local image="${BASH_REMATCH[1]}"
+            # Remove quotes
+            image="${image//\"/}"
+            image="${image//\'/}"
+
+            # Skip empty
+            [[ -z "$image" ]] && continue
+
+            # Check for :latest tag
+            if [[ "$image" =~ :latest$ ]]; then
+                warnings+=("Строка $line_num: ПРЕДУПРЕЖДЕНИЕ: Floating tag ':latest' не рекомендуется")
+                warnings+=("  Image: $image")
+                warnings+=("  Риск: Непредсказуемые обновления, проблемы с откатом")
+                warnings+=("  Рекомендация: Используйте конкретный тег (например, nginx:1.21.0)")
+            # Check for missing tag (no colon after image name, excluding digest)
+            elif [[ ! "$image" =~ : ]] && [[ ! "$image" =~ @ ]]; then
+                warnings+=("Строка $line_num: ПРЕДУПРЕЖДЕНИЕ: Отсутствует тег образа (default: latest)")
+                warnings+=("  Image: $image")
+                warnings+=("  Рекомендация: Укажите конкретный тег: $image:version")
+            fi
+
+            # Check for digest (good practice, just info)
+            if [[ "$image" =~ @sha256: ]]; then
+                # This is actually good, no warning needed
+                :
+            fi
+        fi
+    done < "$file"
+
+    if [[ ${#warnings[@]} -gt 0 ]]; then
+        printf '%s\n' "${warnings[@]}"
+    fi
+    return 0
+}
+
+check_annotation_length() {
+    local file="$1"
+    local line_num=0
+    local errors=()
+    local in_annotations=0
+    local in_labels=0
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Detect sections
+        if [[ "$line" =~ ^[[:space:]]+annotations:[[:space:]]*$ ]]; then
+            in_annotations=1
+            in_labels=0
+            continue
+        fi
+        if [[ "$line" =~ ^[[:space:]]+labels:[[:space:]]*$ ]]; then
+            in_labels=1
+            in_annotations=0
+            continue
+        fi
+
+        # Exit section on dedent
+        if [[ "$line" =~ ^[[:space:]]{0,4}[a-zA-Z] ]] && [[ ! "$line" =~ ^[[:space:]]{4,} ]]; then
+            in_annotations=0
+            in_labels=0
+        fi
+
+        # Check label values (max 63 chars)
+        if [[ $in_labels -eq 1 ]] && [[ "$line" =~ ^[[:space:]]+([^:]+):[[:space:]]+(.+)$ ]]; then
+            local key="${BASH_REMATCH[1]}"
+            local value="${BASH_REMATCH[2]}"
+            key="${key#"${key%%[![:space:]]*}"}"
+            value="${value//\"/}"
+            value="${value//\'/}"
+            value="${value%"${value##*[![:space:]]}"}"
+
+            if [[ ${#value} -gt 63 ]]; then
+                errors+=("Строка $line_num: Label value превышает 63 символа (${#value})")
+                errors+=("  Ключ: $key")
+                errors+=("  Значение: ${value:0:50}...")
+            fi
+        fi
+
+        # Check annotation key format (max 253 chars with prefix)
+        if [[ $in_annotations -eq 1 ]] && [[ "$line" =~ ^[[:space:]]+([^:]+): ]]; then
+            local key="${BASH_REMATCH[1]}"
+            key="${key#"${key%%[![:space:]]*}"}"
+
+            if [[ ${#key} -gt 253 ]]; then
+                errors+=("Строка $line_num: Annotation key превышает 253 символа (${#key})")
+                errors+=("  Ключ: ${key:0:50}...")
+            fi
+        fi
+    done < "$file"
+
+    if [[ ${#errors[@]} -gt 0 ]]; then
+        printf '%s\n' "${errors[@]}"
+        return 1
+    fi
+    return 0
+}
+
+check_security_context() {
+    local file="$1"
+    local line_num=0
+    local warnings=()
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Check for privileged: true
+        if [[ "$line" =~ privileged:[[:space:]]+(true|True|TRUE) ]]; then
+            warnings+=("Строка $line_num: БЕЗОПАСНОСТЬ: privileged: true — контейнер имеет root-доступ к хосту")
+            warnings+=("  Риск: Container escape, полный доступ к хосту")
+            warnings+=("  Рекомендация: Используйте capabilities вместо privileged")
+        fi
+
+        # Check for allowPrivilegeEscalation: true
+        if [[ "$line" =~ allowPrivilegeEscalation:[[:space:]]+(true|True|TRUE) ]]; then
+            warnings+=("Строка $line_num: БЕЗОПАСНОСТЬ: allowPrivilegeEscalation: true")
+            warnings+=("  Рекомендация: Установите allowPrivilegeEscalation: false")
+        fi
+
+        # Check for runAsNonRoot: false (explicitly allowing root)
+        if [[ "$line" =~ runAsNonRoot:[[:space:]]+(false|False|FALSE) ]]; then
+            warnings+=("Строка $line_num: БЕЗОПАСНОСТЬ: runAsNonRoot: false — контейнер может работать от root")
+            warnings+=("  Рекомендация: Установите runAsNonRoot: true и укажите runAsUser")
+        fi
+
+        # Check for hostNetwork: true
+        if [[ "$line" =~ hostNetwork:[[:space:]]+(true|True|TRUE) ]]; then
+            warnings+=("Строка $line_num: БЕЗОПАСНОСТЬ: hostNetwork: true — контейнер использует сеть хоста")
+            warnings+=("  Риск: Доступ ко всем сетевым интерфейсам хоста")
+        fi
+
+        # Check for hostPID: true
+        if [[ "$line" =~ hostPID:[[:space:]]+(true|True|TRUE) ]]; then
+            warnings+=("Строка $line_num: БЕЗОПАСНОСТЬ: hostPID: true — контейнер видит процессы хоста")
+        fi
+
+        # Check for hostIPC: true
+        if [[ "$line" =~ hostIPC:[[:space:]]+(true|True|TRUE) ]]; then
+            warnings+=("Строка $line_num: БЕЗОПАСНОСТЬ: hostIPC: true — контейнер имеет доступ к IPC хоста")
+        fi
+
+        # Check for common typos
+        if [[ "$line" =~ runAsRoot:[[:space:]]+ ]]; then
+            warnings+=("Строка $line_num: ОПЕЧАТКА: 'runAsRoot' не существует, используйте 'runAsNonRoot'")
+        fi
+    done < "$file"
+
+    if [[ ${#warnings[@]} -gt 0 ]]; then
+        printf '%s\n' "${warnings[@]}"
+    fi
+    return 0
+}
+
+check_probe_config() {
+    local file="$1"
+    local line_num=0
+    local warnings=()
+    # shellcheck disable=SC2034  # Used for state tracking in loop
+    local has_liveness=0
+    # shellcheck disable=SC2034  # Used for state tracking in loop
+    local has_readiness=0
+    # shellcheck disable=SC2034  # Used for state tracking in loop
+    local in_container=0
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Track if we're in a container definition (for future probe-per-container checks)
+        if [[ "$line" =~ ^[[:space:]]*-[[:space:]]*name:[[:space:]] ]]; then
+            # New container - reset probes
+            # Note: Missing readinessProbe is common and not an error
+            # shellcheck disable=SC2034
+            in_container=1; has_liveness=0; has_readiness=0
+        fi
+
+        # Detect probes (for future per-container validation)
+        # shellcheck disable=SC2034
+        [[ "$line" =~ livenessProbe: ]] && has_liveness=1
+        # shellcheck disable=SC2034
+        [[ "$line" =~ readinessProbe: ]] && has_readiness=1
+
+        # Check for dangerous probe configurations
+        if [[ "$line" =~ initialDelaySeconds:[[:space:]]+([0-9]+) ]]; then
+            local delay="${BASH_REMATCH[1]}"
+            if [[ $delay -eq 0 ]]; then
+                warnings+=("Строка $line_num: ПРЕДУПРЕЖДЕНИЕ: initialDelaySeconds: 0 может убить pod до старта приложения")
+                warnings+=("  Рекомендация: Установите разумную задержку (например, 10-30 секунд)")
+            fi
+        fi
+
+        # Check for very aggressive timeouts
+        if [[ "$line" =~ timeoutSeconds:[[:space:]]+([0-9]+) ]]; then
+            local timeout="${BASH_REMATCH[1]}"
+            if [[ $timeout -lt 2 ]]; then
+                warnings+=("Строка $line_num: ПРЕДУПРЕЖДЕНИЕ: timeoutSeconds: $timeout очень мал")
+                warnings+=("  Риск: False positives при высокой нагрузке")
+            fi
+        fi
+
+        # Check for very frequent probes
+        if [[ "$line" =~ periodSeconds:[[:space:]]+([0-9]+) ]]; then
+            local period="${BASH_REMATCH[1]}"
+            if [[ $period -lt 5 ]]; then
+                warnings+=("Строка $line_num: ИНФОРМАЦИЯ: periodSeconds: $period — частые проверки увеличивают нагрузку")
+            fi
+        fi
+    done < "$file"
+
+    if [[ ${#warnings[@]} -gt 0 ]]; then
+        printf '%s\n' "${warnings[@]}"
+    fi
+    return 0
+}
+
+check_restart_policy() {
+    local file="$1"
+    local line_num=0
+    local errors=()
+
+    # Valid values for restartPolicy
+    local valid_policies="Always|OnFailure|Never"
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        if [[ "$line" =~ restartPolicy:[[:space:]]+([^[:space:]#]+) ]]; then
+            local policy="${BASH_REMATCH[1]}"
+            policy="${policy//\"/}"
+            policy="${policy//\'/}"
+
+            if [[ ! "$policy" =~ ^($valid_policies)$ ]]; then
+                errors+=("Строка $line_num: Некорректный restartPolicy: '$policy'")
+                errors+=("  Допустимые значения: Always, OnFailure, Never")
+
+                case "${policy,,}" in
+                    always) errors+=("  Исправление: Always") ;;
+                    onfailure) errors+=("  Исправление: OnFailure") ;;
+                    never) errors+=("  Исправление: Never") ;;
+                esac
+            fi
+        fi
+    done < "$file"
+
+    if [[ ${#errors[@]} -gt 0 ]]; then
+        printf '%s\n' "${errors[@]}"
+        return 1
+    fi
+    return 0
+}
+
+check_service_type() {
+    local file="$1"
+    local line_num=0
+    local errors=()
+
+    # Valid values for Service type
+    local valid_types="ClusterIP|NodePort|LoadBalancer|ExternalName"
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Only check type: in Service context (after kind: Service)
+        if [[ "$line" =~ ^[[:space:]]+type:[[:space:]]+([^[:space:]#]+) ]]; then
+            local svc_type="${BASH_REMATCH[1]}"
+            svc_type="${svc_type//\"/}"
+            svc_type="${svc_type//\'/}"
+
+            # Skip non-Service types (like Secret type: Opaque)
+            [[ "$svc_type" == "Opaque" ]] && continue
+            [[ "$svc_type" =~ ^kubernetes.io/ ]] && continue
+            [[ "$svc_type" =~ ^helm.sh/ ]] && continue
+
+            if [[ ! "$svc_type" =~ ^($valid_types)$ ]]; then
+                # Check for common typos
+                case "${svc_type,,}" in
+                    clusterip|nodeport|loadbalancer|externalname)
+                        errors+=("Строка $line_num: Некорректный регистр Service type: '$svc_type'")
+                        errors+=("  Допустимые значения: ClusterIP, NodePort, LoadBalancer, ExternalName")
+                        ;;
+                esac
+            fi
+        fi
+    done < "$file"
+
+    if [[ ${#errors[@]} -gt 0 ]]; then
+        printf '%s\n' "${errors[@]}"
+        return 1
+    fi
+    return 0
+}
+
+check_deckhouse_crd() {
+    local file="$1"
+    local line_num=0
+    local errors=()
+
+    # Deckhouse CRD spec fields - COMPLETE
+    # These schema definitions are for documentation and future generic validation
+    # shellcheck disable=SC2034  # Schema definitions for docs and future validation
+
+    # ModuleConfig spec fields
+    declare -A moduleconfig_spec=(
+        ["version"]="required|integer"
+        ["enabled"]="optional|boolean"
+        ["settings"]="optional|object"
+    )
+
+    # NodeGroup spec fields
+    # shellcheck disable=SC2034
+    declare -A nodegroup_spec=(
+        ["nodeType"]="required|enum:CloudEphemeral,CloudPermanent,CloudStatic,Static"
+        ["cloudInstances"]="optional|object"
+        ["staticInstances"]="optional|object"
+        ["cri"]="optional|object"
+        ["kubelet"]="optional|object"
+        ["disruptions"]="optional|object"
+        ["nodeTemplate"]="optional|object"
+        ["chaos"]="optional|object"
+        ["operatingSystem"]="optional|object"
+        ["update"]="optional|object"
+    )
+
+    # NodeGroup cloudInstances fields
+    # shellcheck disable=SC2034
+    declare -A cloudinstances_spec=(
+        ["minPerZone"]="required|integer"
+        ["maxPerZone"]="required|integer"
+        ["maxUnavailablePerZone"]="optional|integer"
+        ["maxSurgePerZone"]="optional|integer"
+        ["classReference"]="required|object"
+        ["zones"]="optional|array"
+        ["standby"]="optional|integer"
+        ["standbyHolder"]="optional|object"
+    )
+
+    # IngressNginxController spec fields
+    # shellcheck disable=SC2034
+    declare -A ingressnginx_spec=(
+        ["ingressClass"]="required|string"
+        ["inlet"]="required|enum:LoadBalancer,LoadBalancerWithProxyProtocol,HostPort,HostPortWithProxyProtocol,HostWithFailover"
+        ["controllerVersion"]="optional|string"
+        ["enableIstioSidecar"]="optional|boolean"
+        ["waitLoadBalancerOnTerminating"]="optional|integer"
+        ["chaosMonkey"]="optional|boolean"
+        ["validationEnabled"]="optional|boolean"
+        ["annotationValidationEnabled"]="optional|boolean"
+        ["loadBalancer"]="optional|object"
+        ["hostPort"]="optional|object"
+        ["hostPortWithProxyProtocol"]="optional|object"
+        ["loadBalancerWithProxyProtocol"]="optional|object"
+        ["acceptRequestsFrom"]="optional|array"
+        ["hsts"]="optional|boolean"
+        ["hstsOptions"]="optional|object"
+        ["geoIP2"]="optional|object"
+        ["legacySSL"]="optional|boolean"
+        ["disableHTTP2"]="optional|boolean"
+        ["config"]="optional|object"
+        ["additionalHeaders"]="optional|object"
+        ["additionalLogFields"]="optional|object"
+        ["resourcesRequests"]="optional|object"
+        ["customErrors"]="optional|object"
+        ["underscoresInHeaders"]="optional|boolean"
+        ["minReplicas"]="optional|integer"
+        ["maxReplicas"]="optional|integer"
+    )
+
+    # DexAuthenticator spec fields
+    # shellcheck disable=SC2034
+    declare -A dexauthenticator_spec=(
+        ["applicationDomain"]="required|string"
+        ["sendAuthorizationHeader"]="optional|boolean"
+        ["applicationIngressCertificateSecretName"]="optional|string"
+        ["applicationIngressClassName"]="optional|string"
+        ["keepUsersLoggedInFor"]="optional|string"
+        ["allowedGroups"]="optional|array"
+        ["whitelistSourceRanges"]="optional|array"
+        ["nodeSelector"]="optional|object"
+        ["tolerations"]="optional|array"
+    )
+
+    # ClusterAuthorizationRule spec fields
+    # shellcheck disable=SC2034
+    declare -A clusterauthz_spec=(
+        ["subjects"]="required|array"
+        ["accessLevel"]="required|enum:User,PrivilegedUser,Editor,Admin,ClusterEditor,ClusterAdmin,SuperAdmin"
+        ["portForwarding"]="optional|boolean"
+        ["allowScale"]="optional|boolean"
+        ["allowAccessToSystemNamespaces"]="optional|boolean"
+        ["limitNamespaces"]="optional|array"
+        ["additionalRoles"]="optional|array"
+    )
+
+    # User spec fields
+    # shellcheck disable=SC2034
+    declare -A user_spec=(
+        ["email"]="required|string"
+        ["password"]="optional|string"
+        ["userID"]="optional|string"
+        ["groups"]="optional|array"
+        ["ttl"]="optional|string"
+    )
+
+    # ClusterLogDestination spec fields
+    # shellcheck disable=SC2034
+    declare -A logdest_spec=(
+        ["type"]="required|enum:Loki,Elasticsearch,Logstash,Vector,Splunk,Kafka,Socket"
+        ["loki"]="optional|object"
+        ["elasticsearch"]="optional|object"
+        ["logstash"]="optional|object"
+        ["vector"]="optional|object"
+        ["splunk"]="optional|object"
+        ["kafka"]="optional|object"
+        ["socket"]="optional|object"
+        ["extraLabels"]="optional|object"
+        ["rateLimit"]="optional|object"
+        ["buffer"]="optional|object"
+    )
+
+    # VirtualMachine spec fields
+    # shellcheck disable=SC2034
+    declare -A virtualmachine_spec=(
+        ["virtualMachineClassName"]="required|string"
+        ["runPolicy"]="optional|enum:AlwaysOn,AlwaysOff,Manual,AlwaysOnUnlessStoppedGracefully"
+        ["osType"]="optional|enum:Generic,Windows"
+        ["bootloader"]="optional|enum:BIOS,EFI,EFIWithSecureBoot"
+        ["cpu"]="required|object"
+        ["memory"]="required|object"
+        ["blockDeviceRefs"]="required|array"
+        ["provisioning"]="optional|object"
+        ["enableParavirtualization"]="optional|boolean"
+        ["terminationGracePeriodSeconds"]="optional|integer"
+        ["tolerations"]="optional|array"
+        ["nodeSelector"]="optional|object"
+        ["priorityClassName"]="optional|string"
+        ["disruptions"]="optional|object"
+        ["topologySpreadConstraints"]="optional|array"
+        ["affinity"]="optional|object"
+    )
+
+    # PrometheusRemoteWrite spec fields
+    # shellcheck disable=SC2034
+    declare -A prometheusrw_spec=(
+        ["url"]="required|string"
+        ["basicAuth"]="optional|object"
+        ["bearerToken"]="optional|string"
+        ["customAuthToken"]="optional|string"
+        ["tlsConfig"]="optional|object"
+        ["writeRelabelConfigs"]="optional|array"
+    )
+
+    # GrafanaAlertsChannel spec fields
+    # shellcheck disable=SC2034
+    declare -A alertschannel_spec=(
+        ["type"]="required|enum:prometheus,alertmanager"
+        ["alertManager"]="optional|object"
+        ["prometheus"]="optional|object"
+    )
+
+    # KeepalivedInstance spec fields
+    # shellcheck disable=SC2034
+    declare -A keepalived_spec=(
+        ["nodeSelector"]="required|object"
+        ["tolerations"]="optional|array"
+        ["vrrpInstances"]="required|array"
+    )
+
+    # Parse file and validate each document separately (multi-document YAML support)
+    local in_spec=0
+    local current_api=""
+    local current_kind=""
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Document separator - reset state for new document
+        if [[ "$line" =~ ^---[[:space:]]*$ ]] || [[ "$line" == "---" ]]; then
+            in_spec=0
+            current_api=""
+            current_kind=""
+            continue
+        fi
+
+        # Detect apiVersion
+        if [[ "$line" =~ ^apiVersion:[[:space:]]+([^[:space:]#]+) ]]; then
+            current_api="${BASH_REMATCH[1]}"
+        fi
+
+        # Detect kind
+        if [[ "$line" =~ ^kind:[[:space:]]+([^[:space:]#]+) ]]; then
+            current_kind="${BASH_REMATCH[1]}"
+        fi
+
+        # Skip if not Deckhouse CRD
+        [[ ! "$current_api" =~ ^deckhouse.io/ ]] && continue
+
+        # Detect spec section
+        if [[ "$line" =~ ^spec:[[:space:]]*$ ]] || [[ "$line" =~ ^spec:[[:space:]]*# ]]; then
+            in_spec=1
+            continue
+        fi
+
+        # Exit spec on dedent to top level (new section like status:, metadata:)
+        if [[ $in_spec -eq 1 ]] && [[ "$line" =~ ^[a-zA-Z] ]] && [[ ! "$line" =~ ^[[:space:]] ]]; then
+            in_spec=0
+        fi
+
+        # Validate spec fields based on kind
+        if [[ $in_spec -eq 1 ]] && [[ "$line" =~ ^[[:space:]]+([a-zA-Z][a-zA-Z0-9]*): ]]; then
+            local field="${BASH_REMATCH[1]}"
+            local value=""
+            # Extract value, removing trailing comments
+            if [[ "$line" =~ :[[:space:]]+([^#]+) ]]; then
+                value="${BASH_REMATCH[1]}"
+                # Trim trailing whitespace
+                value="${value%"${value##*[![:space:]]}"}"
+            fi
+
+            case "$current_kind" in
+                ModuleConfig)
+                    # Validate version is integer
+                    if [[ "$field" == "version" ]]; then
+                        if [[ ! "$value" =~ ^[0-9]+$ ]]; then
+                            errors+=("Строка $line_num: ModuleConfig.spec.version должен быть integer")
+                            errors+=("  Найдено: $value")
+                        fi
+                    fi
+                    # Validate enabled is boolean
+                    if [[ "$field" == "enabled" ]]; then
+                        if [[ ! "$value" =~ ^(true|false)$ ]]; then
+                            errors+=("Строка $line_num: ModuleConfig.spec.enabled должен быть boolean")
+                            errors+=("  Найдено: $value")
+                            errors+=("  Допустимо: true, false")
+                        fi
+                    fi
+                    ;;
+
+                NodeGroup)
+                    # Validate nodeType enum
+                    if [[ "$field" == "nodeType" ]]; then
+                        if [[ ! "$value" =~ ^(CloudEphemeral|CloudPermanent|CloudStatic|Static)$ ]]; then
+                            errors+=("Строка $line_num: NodeGroup.spec.nodeType некорректный: '$value'")
+                            errors+=("  Допустимо: CloudEphemeral, CloudPermanent, CloudStatic, Static")
+                        fi
+                    fi
+                    ;;
+
+                IngressNginxController)
+                    # Validate inlet enum
+                    if [[ "$field" == "inlet" ]]; then
+                        local valid_inlets="LoadBalancer|LoadBalancerWithProxyProtocol|HostPort|HostPortWithProxyProtocol|HostWithFailover"
+                        if [[ ! "$value" =~ ^($valid_inlets)$ ]]; then
+                            errors+=("Строка $line_num: IngressNginxController.spec.inlet некорректный: '$value'")
+                            errors+=("  Допустимо: LoadBalancer, HostPort, HostPortWithProxyProtocol, HostWithFailover")
+                        fi
+                    fi
+                    ;;
+
+                ClusterAuthorizationRule)
+                    # Validate accessLevel enum
+                    if [[ "$field" == "accessLevel" ]]; then
+                        local valid_levels="User|PrivilegedUser|Editor|Admin|ClusterEditor|ClusterAdmin|SuperAdmin"
+                        if [[ ! "$value" =~ ^($valid_levels)$ ]]; then
+                            errors+=("Строка $line_num: ClusterAuthorizationRule.spec.accessLevel некорректный: '$value'")
+                            errors+=("  Допустимо: User, PrivilegedUser, Editor, Admin, ClusterEditor, ClusterAdmin, SuperAdmin")
+                        fi
+                    fi
+                    ;;
+
+                ClusterLogDestination|PodLogDestination)
+                    # Validate type enum
+                    if [[ "$field" == "type" ]]; then
+                        local valid_types="Loki|Elasticsearch|Logstash|Vector|Splunk|Kafka|Socket"
+                        if [[ ! "$value" =~ ^($valid_types)$ ]]; then
+                            errors+=("Строка $line_num: $current_kind.spec.type некорректный: '$value'")
+                            errors+=("  Допустимо: Loki, Elasticsearch, Logstash, Vector, Splunk, Kafka, Socket")
+                        fi
+                    fi
+                    ;;
+
+                VirtualMachine)
+                    # Validate runPolicy enum
+                    if [[ "$field" == "runPolicy" ]]; then
+                        local valid_policies="AlwaysOn|AlwaysOff|Manual|AlwaysOnUnlessStoppedGracefully"
+                        if [[ ! "$value" =~ ^($valid_policies)$ ]]; then
+                            errors+=("Строка $line_num: VirtualMachine.spec.runPolicy некорректный: '$value'")
+                            errors+=("  Допустимо: AlwaysOn, AlwaysOff, Manual, AlwaysOnUnlessStoppedGracefully")
+                        fi
+                    fi
+                    # Validate osType enum
+                    if [[ "$field" == "osType" ]]; then
+                        if [[ ! "$value" =~ ^(Generic|Windows)$ ]]; then
+                            errors+=("Строка $line_num: VirtualMachine.spec.osType некорректный: '$value'")
+                            errors+=("  Допустимо: Generic, Windows")
+                        fi
+                    fi
+                    # Validate bootloader enum
+                    if [[ "$field" == "bootloader" ]]; then
+                        if [[ ! "$value" =~ ^(BIOS|EFI|EFIWithSecureBoot)$ ]]; then
+                            errors+=("Строка $line_num: VirtualMachine.spec.bootloader некорректный: '$value'")
+                            errors+=("  Допустимо: BIOS, EFI, EFIWithSecureBoot")
+                        fi
+                    fi
+                    ;;
+
+                GrafanaAlertsChannel)
+                    # Validate type enum
+                    if [[ "$field" == "type" ]]; then
+                        if [[ ! "$value" =~ ^(prometheus|alertmanager)$ ]]; then
+                            errors+=("Строка $line_num: GrafanaAlertsChannel.spec.type некорректный: '$value'")
+                            errors+=("  Допустимо: prometheus, alertmanager")
+                        fi
+                    fi
+                    ;;
+            esac
+        fi
+    done < "$file"
+
+    if [[ ${#errors[@]} -gt 0 ]]; then
+        printf '%s\n' "${errors[@]}"
+        return 1
+    fi
+    return 0
+}
+
 check_kubernetes_specific() {
     local file="$1"
     local line_num=0
@@ -1495,12 +2401,137 @@ validate_yaml_file() {
     fi
 
     if [[ $verbose -eq 1 ]]; then
-        echo -e "  ${CYAN}└─ Проверка multiline блоков (|, >)...${NC}"
+        echo -e "  ${CYAN}├─ Проверка multiline блоков (|, >)...${NC}"
     fi
     local multiline_errors
     if ! multiline_errors=$(check_multiline_blocks "$file"); then
         file_errors+=("=== YAML: MULTILINE БЛОКИ ===")
         file_errors+=("$multiline_errors")
+    fi
+
+    # === NEW CHECKS v2.3.0 ===
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка sexagesimal (21:00 = 1260)...${NC}"
+    fi
+    local sexagesimal_warnings
+    sexagesimal_warnings=$(check_sexagesimal "$file")
+    if [[ -n "$sexagesimal_warnings" ]]; then
+        file_errors+=("=== YAML 1.1: SEXAGESIMAL ===")
+        file_errors+=("$sexagesimal_warnings")
+    fi
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка Norway Problem (y/n/NO)...${NC}"
+    fi
+    local norway_warnings
+    norway_warnings=$(check_extended_norway "$file")
+    if [[ -n "$norway_warnings" ]]; then
+        file_errors+=("=== YAML 1.1: NORWAY PROBLEM ===")
+        file_errors+=("$norway_warnings")
+    fi
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка YAML Bomb (Billion Laughs)...${NC}"
+    fi
+    local bomb_errors
+    if ! bomb_errors=$(check_yaml_bomb "$file"); then
+        file_errors+=("=== БЕЗОПАСНОСТЬ: YAML BOMB ===")
+        file_errors+=("$bomb_errors")
+    fi
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка кавычек для спецсимволов...${NC}"
+    fi
+    local quoting_warnings
+    quoting_warnings=$(check_string_quoting "$file")
+    if [[ -n "$quoting_warnings" ]]; then
+        file_errors+=("=== YAML: КАВЫЧКИ ===")
+        file_errors+=("$quoting_warnings")
+    fi
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка imagePullPolicy...${NC}"
+    fi
+    local pullpolicy_errors
+    if ! pullpolicy_errors=$(check_image_pull_policy "$file"); then
+        file_errors+=("=== KUBERNETES: IMAGEPULLPOLICY ===")
+        file_errors+=("$pullpolicy_errors")
+    fi
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка replicas (тип данных)...${NC}"
+    fi
+    local replicas_errors
+    if ! replicas_errors=$(check_replicas_type "$file"); then
+        file_errors+=("=== KUBERNETES: REPLICAS ===")
+        file_errors+=("$replicas_errors")
+    fi
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка image tags (:latest)...${NC}"
+    fi
+    local imagetag_warnings
+    imagetag_warnings=$(check_image_tags "$file")
+    if [[ -n "$imagetag_warnings" ]]; then
+        file_errors+=("=== KUBERNETES: IMAGE TAGS ===")
+        file_errors+=("$imagetag_warnings")
+    fi
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка длины labels/annotations...${NC}"
+    fi
+    local length_errors
+    if ! length_errors=$(check_annotation_length "$file"); then
+        file_errors+=("=== KUBERNETES: LABEL/ANNOTATION LENGTH ===")
+        file_errors+=("$length_errors")
+    fi
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка securityContext...${NC}"
+    fi
+    local security_warnings
+    security_warnings=$(check_security_context "$file")
+    if [[ -n "$security_warnings" ]]; then
+        file_errors+=("=== БЕЗОПАСНОСТЬ: SECURITY CONTEXT ===")
+        file_errors+=("$security_warnings")
+    fi
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка probe config...${NC}"
+    fi
+    local probe_warnings
+    probe_warnings=$(check_probe_config "$file")
+    if [[ -n "$probe_warnings" ]]; then
+        file_errors+=("=== KUBERNETES: PROBES ===")
+        file_errors+=("$probe_warnings")
+    fi
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка restartPolicy...${NC}"
+    fi
+    local restart_errors
+    if ! restart_errors=$(check_restart_policy "$file"); then
+        file_errors+=("=== KUBERNETES: RESTARTPOLICY ===")
+        file_errors+=("$restart_errors")
+    fi
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка Service type...${NC}"
+    fi
+    local svctype_errors
+    if ! svctype_errors=$(check_service_type "$file"); then
+        file_errors+=("=== KUBERNETES: SERVICE TYPE ===")
+        file_errors+=("$svctype_errors")
+    fi
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}└─ Проверка Deckhouse CRD...${NC}"
+    fi
+    local deckhouse_errors
+    if ! deckhouse_errors=$(check_deckhouse_crd "$file"); then
+        file_errors+=("=== DECKHOUSE: CRD VALIDATION ===")
+        file_errors+=("$deckhouse_errors")
     fi
 
     if [[ ${#file_errors[@]} -eq 0 ]]; then
