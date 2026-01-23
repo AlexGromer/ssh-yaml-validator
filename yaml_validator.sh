@@ -1009,6 +1009,7 @@ check_yaml_bomb() {
     local file="$1"
     local errors=()
     declare -A anchor_refs
+    # shellcheck disable=SC2034  # Reserved for future deep recursion check
     local max_depth=5
     local max_refs=10
 
@@ -1368,29 +1369,29 @@ check_probe_config() {
     local file="$1"
     local line_num=0
     local warnings=()
+    # shellcheck disable=SC2034  # Used for state tracking in loop
     local has_liveness=0
+    # shellcheck disable=SC2034  # Used for state tracking in loop
     local has_readiness=0
+    # shellcheck disable=SC2034  # Used for state tracking in loop
     local in_container=0
 
     while IFS= read -r line || [[ -n "$line" ]]; do
         ((line_num++))
 
-        # Track if we're in a container definition
+        # Track if we're in a container definition (for future probe-per-container checks)
         if [[ "$line" =~ ^[[:space:]]*-[[:space:]]*name:[[:space:]] ]]; then
             # New container - reset probes
             # Note: Missing readinessProbe is common and not an error
-            in_container=1
-            has_liveness=0
-            has_readiness=0
+            # shellcheck disable=SC2034
+            in_container=1; has_liveness=0; has_readiness=0
         fi
 
-        # Detect probes
-        if [[ "$line" =~ livenessProbe: ]]; then
-            has_liveness=1
-        fi
-        if [[ "$line" =~ readinessProbe: ]]; then
-            has_readiness=1
-        fi
+        # Detect probes (for future per-container validation)
+        # shellcheck disable=SC2034
+        [[ "$line" =~ livenessProbe: ]] && has_liveness=1
+        # shellcheck disable=SC2034
+        [[ "$line" =~ readinessProbe: ]] && has_readiness=1
 
         # Check for dangerous probe configurations
         if [[ "$line" =~ initialDelaySeconds:[[:space:]]+([0-9]+) ]]; then
@@ -1509,7 +1510,8 @@ check_deckhouse_crd() {
 
     # Deckhouse CRD spec fields - COMPLETE
     # These schema definitions are for documentation and future generic validation
-    # shellcheck disable=SC2034
+    # shellcheck disable=SC2034  # Schema definitions for docs and future validation
+
     # ModuleConfig spec fields
     declare -A moduleconfig_spec=(
         ["version"]="required|integer"
@@ -1518,6 +1520,7 @@ check_deckhouse_crd() {
     )
 
     # NodeGroup spec fields
+    # shellcheck disable=SC2034
     declare -A nodegroup_spec=(
         ["nodeType"]="required|enum:CloudEphemeral,CloudPermanent,CloudStatic,Static"
         ["cloudInstances"]="optional|object"
@@ -1532,6 +1535,7 @@ check_deckhouse_crd() {
     )
 
     # NodeGroup cloudInstances fields
+    # shellcheck disable=SC2034
     declare -A cloudinstances_spec=(
         ["minPerZone"]="required|integer"
         ["maxPerZone"]="required|integer"
@@ -1544,6 +1548,7 @@ check_deckhouse_crd() {
     )
 
     # IngressNginxController spec fields
+    # shellcheck disable=SC2034
     declare -A ingressnginx_spec=(
         ["ingressClass"]="required|string"
         ["inlet"]="required|enum:LoadBalancer,LoadBalancerWithProxyProtocol,HostPort,HostPortWithProxyProtocol,HostWithFailover"
@@ -1574,6 +1579,7 @@ check_deckhouse_crd() {
     )
 
     # DexAuthenticator spec fields
+    # shellcheck disable=SC2034
     declare -A dexauthenticator_spec=(
         ["applicationDomain"]="required|string"
         ["sendAuthorizationHeader"]="optional|boolean"
@@ -1587,6 +1593,7 @@ check_deckhouse_crd() {
     )
 
     # ClusterAuthorizationRule spec fields
+    # shellcheck disable=SC2034
     declare -A clusterauthz_spec=(
         ["subjects"]="required|array"
         ["accessLevel"]="required|enum:User,PrivilegedUser,Editor,Admin,ClusterEditor,ClusterAdmin,SuperAdmin"
@@ -1598,6 +1605,7 @@ check_deckhouse_crd() {
     )
 
     # User spec fields
+    # shellcheck disable=SC2034
     declare -A user_spec=(
         ["email"]="required|string"
         ["password"]="optional|string"
@@ -1607,6 +1615,7 @@ check_deckhouse_crd() {
     )
 
     # ClusterLogDestination spec fields
+    # shellcheck disable=SC2034
     declare -A logdest_spec=(
         ["type"]="required|enum:Loki,Elasticsearch,Logstash,Vector,Splunk,Kafka,Socket"
         ["loki"]="optional|object"
@@ -1622,6 +1631,7 @@ check_deckhouse_crd() {
     )
 
     # VirtualMachine spec fields
+    # shellcheck disable=SC2034
     declare -A virtualmachine_spec=(
         ["virtualMachineClassName"]="required|string"
         ["runPolicy"]="optional|enum:AlwaysOn,AlwaysOff,Manual,AlwaysOnUnlessStoppedGracefully"
@@ -1642,6 +1652,7 @@ check_deckhouse_crd() {
     )
 
     # PrometheusRemoteWrite spec fields
+    # shellcheck disable=SC2034
     declare -A prometheusrw_spec=(
         ["url"]="required|string"
         ["basicAuth"]="optional|object"
@@ -1652,6 +1663,7 @@ check_deckhouse_crd() {
     )
 
     # GrafanaAlertsChannel spec fields
+    # shellcheck disable=SC2034
     declare -A alertschannel_spec=(
         ["type"]="required|enum:prometheus,alertmanager"
         ["alertManager"]="optional|object"
@@ -1659,6 +1671,7 @@ check_deckhouse_crd() {
     )
 
     # KeepalivedInstance spec fields
+    # shellcheck disable=SC2034
     declare -A keepalived_spec=(
         ["nodeSelector"]="required|object"
         ["tolerations"]="optional|array"
