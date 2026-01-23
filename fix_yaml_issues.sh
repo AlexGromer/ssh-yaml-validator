@@ -4,7 +4,7 @@
 # YAML Auto-Fix Script
 # Автоматическое исправление простых ошибок в YAML файлах
 # Для использования в закрытых контурах
-# Version: 2.0.0
+# Version: 2.1.0
 #############################################################################
 
 set -o pipefail
@@ -27,7 +27,7 @@ TOTAL_FILES=0
 print_header() {
     echo -e "${BOLD}${CYAN}"
     echo "╔═══════════════════════════════════════════════════════════════════════╗"
-    echo "║                    YAML Auto-Fix Tool v2.0.0                          ║"
+    echo "║                    YAML Auto-Fix Tool v2.1.0                          ║"
     echo "║              Автоматическое исправление YAML файлов                   ║"
     echo "╚═══════════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
@@ -44,9 +44,13 @@ usage() {
     -h, --help              Показать эту справку
 
 Исправляемые проблемы:
-    1. Windows encoding (CRLF -> LF)
-    2. Табы -> пробелы (2 пробела на таб)
-    3. Trailing whitespace
+    1. BOM (Byte Order Mark) - удаление невидимых символов в начале файла
+    2. Windows encoding (CRLF -> LF)
+    3. Табы -> пробелы (2 пробела на таб)
+    4. Trailing whitespace
+    5. Boolean регистр (True->true, False->false, TRUE->true, FALSE->false)
+    6. List spacing (-item -> - item)
+    7. Document markers (---- -> ---, ..... -> ...)
 
 Примеры:
     $0 /path/to/manifests
@@ -71,9 +75,21 @@ fix_file() {
 
     echo -e "${CYAN}[ОБРАБОТКА]${NC} $file"
 
+    local has_bom=0
     local has_crlf=0
     local has_tabs=0
     local has_trailing=0
+    local has_booleans=0
+    local has_list_spacing=0
+    local has_doc_markers=0
+
+    # Check for BOM
+    local first_bytes
+    first_bytes=$(head -c 3 "$file" | od -An -tx1 | tr -d ' \n')
+    if [[ "$first_bytes" == "efbbbf" ]]; then
+        has_bom=1
+        echo -e "  ${YELLOW}├─ Обнаружен BOM (Byte Order Mark)${NC}"
+    fi
 
     if grep -q $'\r' "$file" 2>/dev/null; then
         has_crlf=1
@@ -90,7 +106,25 @@ fix_file() {
         echo -e "  ${YELLOW}├─ Обнаружены trailing whitespace${NC}"
     fi
 
-    if [[ $has_crlf -eq 1 || $has_tabs -eq 1 || $has_trailing -eq 1 ]]; then
+    # Check for boolean case issues (True, False, TRUE, FALSE)
+    if grep -qE ': *(True|TRUE|False|FALSE)[[:space:]]*$' "$file" 2>/dev/null; then
+        has_booleans=1
+        echo -e "  ${YELLOW}├─ Обнаружены boolean значения с неправильным регистром${NC}"
+    fi
+
+    # Check for list items without space (-item instead of - item)
+    if grep -qE '^[[:space:]]*-[^[:space:]-]' "$file" 2>/dev/null; then
+        has_list_spacing=1
+        echo -e "  ${YELLOW}├─ Обнаружены элементы списка без пробела после дефиса${NC}"
+    fi
+
+    # Check for malformed document markers (----, ....., etc)
+    if grep -qE '^-{4,}[[:space:]]*$|^\.{4,}[[:space:]]*$' "$file" 2>/dev/null; then
+        has_doc_markers=1
+        echo -e "  ${YELLOW}├─ Обнаружены некорректные маркеры документа${NC}"
+    fi
+
+    if [[ $has_bom -eq 1 || $has_crlf -eq 1 || $has_tabs -eq 1 || $has_trailing -eq 1 || $has_booleans -eq 1 || $has_list_spacing -eq 1 || $has_doc_markers -eq 1 ]]; then
         if [[ $dry_run -eq 1 ]]; then
             echo -e "  ${BLUE}└─ [DRY-RUN] Файл будет исправлен${NC}"
         else
@@ -99,6 +133,12 @@ fix_file() {
             fi
 
             local temp_file="${file}.tmp.$$"
+
+            if [[ $has_bom -eq 1 ]]; then
+                # Remove BOM (first 3 bytes)
+                sed -i '1s/^\xEF\xBB\xBF//' "$file"
+                echo -e "  ${GREEN}├─ [✓] Удален BOM${NC}"
+            fi
 
             if [[ $has_crlf -eq 1 ]]; then
                 sed 's/\r$//' "$file" > "$temp_file"
@@ -115,6 +155,24 @@ fix_file() {
             if [[ $has_trailing -eq 1 ]]; then
                 sed -i 's/[[:space:]]*$//' "$file"
                 echo -e "  ${GREEN}├─ [✓] Удалены trailing whitespace${NC}"
+            fi
+
+            if [[ $has_booleans -eq 1 ]]; then
+                # Fix boolean case: True->true, False->false, TRUE->true, FALSE->false
+                sed -i 's/: True$/: true/g; s/: FALSE$/: false/g; s/: TRUE$/: true/g; s/: False$/: false/g' "$file"
+                echo -e "  ${GREEN}├─ [✓] Исправлен регистр boolean значений${NC}"
+            fi
+
+            if [[ $has_list_spacing -eq 1 ]]; then
+                # Fix list spacing: -item -> - item
+                sed -i 's/^\([[:space:]]*\)-\([^[:space:]-]\)/\1- \2/' "$file"
+                echo -e "  ${GREEN}├─ [✓] Добавлены пробелы после дефисов в списках${NC}"
+            fi
+
+            if [[ $has_doc_markers -eq 1 ]]; then
+                # Fix document markers: ---- -> ---, ..... -> ...
+                sed -i 's/^-\{4,\}$/---/g; s/^\.\{4,\}$/\.\.\./g' "$file"
+                echo -e "  ${GREEN}├─ [✓] Исправлены маркеры документа${NC}"
             fi
 
             echo -e "  ${GREEN}└─ [УСПЕХ] Файл исправлен${NC}"
