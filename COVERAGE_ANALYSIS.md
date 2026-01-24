@@ -35,17 +35,17 @@
 | A11 | Unpaired brackets | brackets/braces | check_basic_syntax | ✅ |
 | A12 | Colon spacing | colons | check_colons_spacing | ✅ |
 | A13 | Comment formatting | comments | check_comment_format | ✅ |
-| A14 | Comment indentation | comments-indentation | - | ❌ TODO |
+| A14 | Comment indentation | comments-indentation | check_comment_indentation | ✅ |
 | A15 | Line length limit | line-length | check_line_length | ✅ |
 | A16 | Empty lines control | empty-lines | check_empty_lines | ✅ |
 | A17 | Newline at EOF | new-line-at-end-of-file | check_newline_at_eof | ✅ |
-| A18 | Key ordering | key-ordering | - | ❌ OPTIONAL |
+| A18 | Key ordering (K8s) | key-ordering | check_key_ordering | ✅ OPT |
 | A19 | Multiline blocks (|, >) | - | check_multiline_blocks | ✅ |
 | A20 | Flow style ({}, []) | braces/brackets | check_flow_style | ✅ |
 | A21 | Brackets spacing | brackets | check_brackets_spacing | ✅ |
 | A22 | Truthy values (yamllint) | truthy | check_truthy_values | ✅ |
 
-**Покрытие A: 19/22 = 86%**
+**Покрытие A: 22/22 = 100%** *(A18 опционально, включается через --key-ordering)*
 
 ---
 
@@ -71,12 +71,12 @@
 | B14 | YAML bomb detection | - | check_yaml_bomb | ✅ |
 | B15 | String quoting requirements | quoted-strings | check_string_quoting | ✅ |
 | B16 | Embedded JSON validation | - | check_embedded_json | ✅ |
-| B17 | Float numeral before decimal | float-values | - | ❌ TODO |
-| B18 | Forbid NaN/Inf explicitly | float-values | - | ⚠️ PARTIAL |
-| B19 | Max nesting depth | - | - | ❌ TODO |
-| B20 | Unicode normalization | - | - | ❌ TODO |
+| B17 | Float numeral before decimal | float-values | check_float_leading_zero | ✅ |
+| B18 | Forbid NaN/Inf explicitly | float-values | check_special_floats | ✅ |
+| B19 | Max nesting depth | - | check_nesting_depth | ✅ |
+| B20 | Unicode normalization | - | check_unicode_normalization | ✅ |
 
-**Покрытие B: 16/20 = 80%**
+**Покрытие B: 20/20 = 100%**
 
 ---
 
@@ -116,8 +116,12 @@
 | C28 | Probe configuration | K8s spec | check_probe_config | ✅ |
 | C29 | Field name typos (snake→camel) | - | check_kubernetes_specific | ✅ |
 | C30 | Schema validation (full) | kubeconform | - | ❌ COMPLEX |
+| **Partial Schema (Bash)** ||||
+| C31 | Field types (integer/string) | K8s spec | check_field_types | ✅ OPT |
+| C32 | Enum value validation | K8s spec | check_enum_values | ✅ OPT |
+| C33 | Required nested fields | K8s spec | check_required_nested | ✅ OPT |
 
-**Покрытие C: 29/30 = 97%**
+**Покрытие C: 32/33 = 97%** *(C30 требует внешних зависимостей; C31-C33 частичная реализация через --partial-schema)*
 
 ---
 
@@ -149,10 +153,10 @@
 | **kube-linter Security** ||||
 | D18 | docker.sock mount | kube-linter | check_sensitive_mounts | ✅ |
 | D19 | Sensitive host mounts | kube-linter | check_sensitive_mounts | ✅ |
-| D20 | Writable host mount | kube-linter | - | ❌ TODO |
+| D20 | Writable host mount | kube-linter | check_writable_hostpath | ✅ |
 | D21 | SSH port (22) detection | kube-linter | check_privileged_ports | ✅ |
 | D22 | Privileged ports (<1024) | kube-linter | check_privileged_ports | ✅ |
-| D23 | drop NET_RAW capability | kube-linter | - | ❌ TODO |
+| D23 | drop NET_RAW capability | kube-linter | check_drop_net_raw | ✅ |
 | D24 | readOnlyRootFilesystem | kube-linter | check_security_context | ✅ |
 | D25 | CVE-2023-3676 (subPath) | CVE | check_volume_mounts | ✅ |
 | **CIS/RBAC** ||||
@@ -162,7 +166,7 @@
 | D29 | Wildcard in RBAC rules | kube-linter | check_rbac_security | ✅ |
 | D30 | Access to secrets check | kube-linter | check_rbac_security | ✅ |
 
-**Покрытие D: 28/30 = 93%**
+**Покрытие D: 30/30 = 100%**
 
 ---
 
@@ -179,21 +183,21 @@
 | E5 | Missing CPU limits | Polaris | check_resource_format | ✅ |
 | E6 | Missing memory requests | Polaris | check_resource_format | ✅ |
 | E7 | Missing memory limits | Polaris | check_resource_format | ✅ |
-| E8 | Replicas < 3 (HA) | kube-linter | - | ❌ TODO |
-| E9 | Missing anti-affinity | kube-linter | - | ❌ TODO |
-| E10 | No rolling update strategy | kube-linter | - | ❌ TODO |
-| E11 | Dangling services | kube-linter | - | ❌ TODO |
-| E12 | Dangling ingress | kube-linter | - | ❌ TODO |
-| E13 | Dangling HPA | kube-linter | - | ❌ TODO |
-| E14 | Dangling NetworkPolicy | kube-linter | - | ❌ TODO |
-| E15 | Duplicate env vars | kube-linter | - | ❌ TODO |
-| E16 | Missing namespace | kube-linter | - | ❌ TODO |
-| E17 | Priority class not set | kube-linter | - | ❌ TODO |
-| E18 | Probe ports validation | kube-linter | - | ❌ TODO |
-| E19 | Missing owner label | kube-linter | - | ❌ TODO |
+| E8 | Replicas < 3 (HA) | kube-linter | check_replicas_ha | ✅ |
+| E9 | Missing anti-affinity | kube-linter | check_anti_affinity | ✅ |
+| E10 | No rolling update strategy | kube-linter | check_rolling_update | ✅ |
+| E11 | Dangling services | kube-linter | check_dangling_resources | ✅ |
+| E12 | Dangling ingress | kube-linter | check_dangling_resources | ✅ |
+| E13 | Dangling HPA | kube-linter | check_dangling_resources | ✅ |
+| E14 | Dangling NetworkPolicy | kube-linter | check_dangling_resources | ✅ |
+| E15 | Duplicate env vars | kube-linter | check_duplicate_env | ✅ |
+| E16 | Missing namespace | kube-linter | check_missing_namespace | ✅ |
+| E17 | Priority class not set | kube-linter | check_priority_class | ✅ |
+| E18 | Probe ports validation | kube-linter | check_probe_ports | ✅ |
+| E19 | Missing owner label | kube-linter | check_owner_label | ✅ |
 | E20 | Deckhouse CRD validation | Deckhouse | check_deckhouse_crd | ✅ |
 
-**Покрытие E: 8/20 = 40%**
+**Покрытие E: 20/20 = 100%**
 
 ---
 
@@ -201,13 +205,13 @@
 
 | Категория | Вес | Покрытие | Взвешенное |
 |-----------|-----|----------|------------|
-| A. YAML Syntax | 25% | 86% | 21.5% |
-| B. YAML Semantics | 15% | 80% | 12.0% |
+| A. YAML Syntax | 25% | 100% | 25.0% |
+| B. YAML Semantics | 15% | 100% | 15.0% |
 | C. Kubernetes Base | 20% | 97% | 19.4% |
-| D. Kubernetes Security | 25% | 93% | 23.3% |
-| E. Kubernetes Best Practices | 15% | 40% | 6.0% |
+| D. Kubernetes Security | 25% | 100% | 25.0% |
+| E. Kubernetes Best Practices | 15% | 100% | 15.0% |
 
-**ОБЩЕЕ ПОКРЫТИЕ: 82.2%** *(+19% vs v2.5.0)*
+**ОБЩЕЕ ПОКРЫТИЕ: 99.4%** *(+11.25% vs v2.7.0)*
 
 ---
 
@@ -217,43 +221,86 @@
 |--------|----------|--------|-------------------|
 | v2.5.0 | 63.2% | - | Базовая версия анализа |
 | v2.6.0 | 82.2% | +19.0% | PSS Baseline/Restricted, RBAC, yamllint-compatible |
+| v2.7.0 | 88.15% | +5.95% | Severity levels, A14, B17-B20, D20, D23 |
+| v2.8.0 | 99.4% | +11.25% | A18, C31-C33, E8-E19, auto-fixer v3.0.0 |
 
 ---
 
-## Реализованные проверки в v2.6.0
+## Реализованные проверки в v2.8.0
 
-### PSS Security (8 новых функций)
-- `check_pss_baseline` — hostPort, capabilities, procMount, sysctls, AppArmor, SELinux
-- `check_pss_restricted` — runAsUser/Group, fsGroup, volume types, seccomp
-- `check_sensitive_mounts` — docker.sock, /etc, /, /proc, /sys, /dev, kubelet, etcd
-- `check_privileged_ports` — SSH (22), Docker API (2375), Kubernetes ports
-- `check_rbac_security` — cluster-admin, wildcards, default SA, secrets access
-- `check_secrets_in_env` — PASSWORD, TOKEN, API_KEY patterns in env
-- `check_default_service_account` — serviceAccountName: default warning
+### A18: K8s Key Ordering (опционально)
+- `check_key_ordering` — проверка порядка ключей по конвенции K8s
+- Порядок: apiVersion → kind → metadata → spec → data → status
+- Включается через `--key-ordering` или `--all-checks`
 
-### yamllint-compatible (7 новых функций)
-- `check_line_length` — предупреждение о строках > 120 символов
-- `check_comment_format` — пробел после # в комментариях
-- `check_empty_lines` — не более 2 пустых строк подряд
-- `check_newline_at_eof` — POSIX-совместимость
-- `check_colons_spacing` — пробелы у двоеточий
-- `check_brackets_spacing` — пробелы в скобках
-- `check_truthy_values` — yes/no/on/off предупреждения
+### C31-C33: Partial Schema Validation (опционально)
+- `check_field_types` — проверка типов полей (replicas, ports = integer)
+- `check_enum_values` — проверка enum значений (restartPolicy, imagePullPolicy, protocol, type)
+- `check_required_nested` — проверка обязательных вложенных полей
+- Включается через `--partial-schema` или `--all-checks`
+
+### E8-E19: Best Practices (12 новых функций)
+- `check_replicas_ha` — предупреждение при replicas < 3
+- `check_anti_affinity` — отсутствие podAntiAffinity в Deployment
+- `check_rolling_update` — отсутствие/неверная стратегия обновления
+- `check_dangling_resources` — эвристика для висячих Service/Ingress/HPA/NetworkPolicy
+- `check_duplicate_env` — дублирующиеся имена env переменных
+- `check_missing_namespace` — отсутствие namespace в namespaced ресурсах
+- `check_priority_class` — отсутствие priorityClassName
+- `check_probe_ports` — несоответствие портов в probes и containerPort
+- `check_owner_label` — отсутствие app.kubernetes.io/managed-by или owner label
+
+### Auto-Fixer v3.0.0 (13 безопасных + 5 интерактивных)
+
+**Автоматические исправления:**
+1. BOM removal
+2. CRLF → LF
+3. Tabs → Spaces
+4. Trailing whitespace
+5. Boolean case (True → true)
+6. List spacing (-item → - item)
+7. Document markers (---- → ---)
+8. Colon spacing (key:value → key: value)
+9. Empty lines (>2 → 2)
+10. Newline at EOF
+11. Bracket spacing ([a,b] → [a, b])
+12. Comment space (#comment → # comment)
+13. Truthy values (yes/no → true/false)
+
+**Интерактивные исправления (-i):**
+- Security: privileged, hostNetwork, hostPID, hostIPC, allowPrivilegeEscalation, runAsUser: 0
+- Image tags: :latest → :stable
+- Missing namespace: добавление с запросом имени
+- Missing probes: показ шаблона
+- Missing resources: показ шаблона
 
 ---
 
 ## Оставшиеся улучшения
 
-### Высокий приоритет
-1. **D20: Writable host mount** — проверка readOnly: false в hostPath
-2. **D23: drop NET_RAW capability** — best practice для сетевой безопасности
+### Единственное неимплементированное
+1. **C30: Full JSON Schema validation** — требует внешних зависимостей (kubeconform, ~50MB схем)
+   - Рекомендация: использовать вместе с kubeconform для полной валидации
+   - Частичная реализация через C31-C33
 
-### Средний приоритет
-3. **A14: Comment indentation** — yamllint comments-indentation rule
-4. **B17-B20** — дополнительные семантические проверки
+### Расширения (отдельные модули)
+См. ROADMAP.md для списка YAML-систем:
+- Ansible, Helm, GitLab CI, GitHub Actions, Docker Compose, ArgoCD, Tekton и др.
 
-### Низкий приоритет (Best Practices)
-5. **E8-E19** — HA, dangling resources, namespaces, priority classes
+---
+
+## Новые опции командной строки v2.8.0
+
+```bash
+# Опциональные проверки
+--key-ordering         # Включить A18: проверку порядка ключей K8s
+--partial-schema       # Включить C31-C33: частичную схема-валидацию
+--all-checks           # Включить все опциональные проверки
+
+# Режимы строгости (из v2.7.0)
+-s, --strict           # WARNING/SECURITY = ERROR
+--security-mode MODE   # strict|normal|permissive
+```
 
 ---
 
