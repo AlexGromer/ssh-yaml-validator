@@ -25,6 +25,7 @@ fi
 FIXED_FILES=0
 TOTAL_FILES=0
 INTERACTIVE=0
+FROM_REPORT=""
 
 # Track fix statistics
 declare -A FIX_COUNTS=(
@@ -61,6 +62,7 @@ usage() {
     -b, --backup            Создать резервные копии (*.yaml.bak)
     -n, --dry-run           Только показать, что будет сделано (не изменять файлы)
     -i, --interactive       Интерактивный режим для сложных исправлений
+    --from-report FILE      Использовать JSON отчет валидатора для целевых исправлений
     -v, --verbose           Подробный вывод
     -h, --help              Показать эту справку
 
@@ -93,6 +95,10 @@ usage() {
     $0 --dry-run /path/to/manifests
     $0 -i -r /path/to/manifests     # Интерактивный режим
 
+    # Интеграция с валидатором:
+    ./yaml_validator.sh --json manifests/ > report.json
+    $0 --from-report report.json manifests/
+
 EOF
     exit 0
 }
@@ -119,7 +125,42 @@ ask_user() {
     read -r response
     response=${response:-$default}
 
-    [[ "${response,,}" == "y" || "${response,,}" == "yes" ]]
+    [[ "${response,,}" == "y" || "${response||}" == "yes" ]]
+}
+
+# Parse JSON report from yaml_validator.sh
+# Returns space-separated list of fix_types for a given file
+get_fixable_issues() {
+    local report_file="$1"
+    local target_file="$2"
+    local fix_types=""
+
+    # Extract fixable issues for this file from JSON
+    if [[ -f "$report_file" ]]; then
+        # Use python/jq if available, otherwise fallback to grep
+        if command -v jq &>/dev/null; then
+            fix_types=$(jq -r --arg file "$target_file" '.files[] | select(.path == $file) | .issues[] | select(.fixable == true) | .fix_type' "$report_file" 2>/dev/null | sort -u | tr '\n' ' ')
+        else
+            # Fallback: simple grep-based parser (less reliable but works without jq)
+            fix_types=$(grep -oP "\"path\":\"$(printf '%s' "$target_file" | sed 's/[\/&]/\\&/g')\".*?\"fix_type\":\"\\K[^\"]*" "$report_file" 2>/dev/null | sort -u | tr '\n' ' ')
+        fi
+    fi
+
+    echo "$fix_types"
+}
+
+# Check if specific fix_type should be applied
+should_fix() {
+    local fix_type="$1"
+    local allowed_fixes="$2"
+
+    # If no report mode, fix everything
+    [[ -z "$FROM_REPORT" ]] && return 0
+
+    # In report mode, only fix issues from report
+    [[ " $allowed_fixes " == *" $fix_type "* ]] && return 0
+
+    return 1
 }
 
 # Fix colon spacing: key:value -> key: value
@@ -454,8 +495,14 @@ fix_file() {
     local backup="$2"
     local dry_run="$3"
     local interactive="$4"
+    local allowed_fixes="${5:-}"
 
     echo -e "${CYAN}[ОБРАБОТКА]${NC} $file"
+
+    # If using report mode, show allowed fixes
+    if [[ -n "$FROM_REPORT" && -n "$allowed_fixes" ]]; then
+        echo -e "  ${BLUE}[ОТЧЕТ]${NC} Исправляемые проблемы: $allowed_fixes"
+    fi
 
     local has_bom=0
     local has_crlf=0
@@ -517,7 +564,7 @@ fix_file() {
     fi
 
     # Apply basic fixes
-    if [[ $has_bom -eq 1 ]]; then
+    if [[ $has_bom -eq 1 ]] && should_fix "bom" "$allowed_fixes"; then
         if [[ $dry_run -eq 0 ]]; then
             sed -i '1s/^\xEF\xBB\xBF//' "$file"
             echo -e "  ${GREEN}├─ [✓] Удален BOM${NC}"
@@ -526,7 +573,7 @@ fix_file() {
         ((total_fixes++))
     fi
 
-    if [[ $has_crlf -eq 1 ]]; then
+    if [[ $has_crlf -eq 1 ]] && should_fix "crlf" "$allowed_fixes"; then
         if [[ $dry_run -eq 0 ]]; then
             local temp_file="${file}.tmp.$$"
             sed 's/\r$//' "$file" > "$temp_file"
@@ -537,7 +584,7 @@ fix_file() {
         ((total_fixes++))
     fi
 
-    if [[ $has_tabs -eq 1 ]]; then
+    if [[ $has_tabs -eq 1 ]] && should_fix "tabs" "$allowed_fixes"; then
         if [[ $dry_run -eq 0 ]]; then
             local temp_file="${file}.tmp.$$"
             expand -t 2 "$file" > "$temp_file"
@@ -548,7 +595,7 @@ fix_file() {
         ((total_fixes++))
     fi
 
-    if [[ $has_trailing -eq 1 ]]; then
+    if [[ $has_trailing -eq 1 ]] && should_fix "trailing" "$allowed_fixes"; then
         if [[ $dry_run -eq 0 ]]; then
             sed -i 's/[[:space:]]*$//' "$file"
             echo -e "  ${GREEN}├─ [✓] Удалены trailing whitespace${NC}"
@@ -557,7 +604,7 @@ fix_file() {
         ((total_fixes++))
     fi
 
-    if [[ $has_booleans -eq 1 ]]; then
+    if [[ $has_booleans -eq 1 ]] && should_fix "booleans" "$allowed_fixes"; then
         if [[ $dry_run -eq 0 ]]; then
             sed -i 's/: True$/: true/g; s/: FALSE$/: false/g; s/: TRUE$/: true/g; s/: False$/: false/g' "$file"
             echo -e "  ${GREEN}├─ [✓] Исправлен регистр boolean значений${NC}"
@@ -566,7 +613,7 @@ fix_file() {
         ((total_fixes++))
     fi
 
-    if [[ $has_list_spacing -eq 1 ]]; then
+    if [[ $has_list_spacing -eq 1 ]] && should_fix "list_spacing" "$allowed_fixes"; then
         if [[ $dry_run -eq 0 ]]; then
             sed -i 's/^\([[:space:]]*\)-\([^[:space:]-]\)/\1- \2/' "$file"
             echo -e "  ${GREEN}├─ [✓] Добавлены пробелы после дефисов в списках${NC}"
@@ -575,7 +622,7 @@ fix_file() {
         ((total_fixes++))
     fi
 
-    if [[ $has_doc_markers -eq 1 ]]; then
+    if [[ $has_doc_markers -eq 1 ]] && should_fix "doc_markers" "$allowed_fixes"; then
         if [[ $dry_run -eq 0 ]]; then
             sed -i 's/^-\{4,\}$/---/g; s/^\.\{4,\}$/\.\.\./g' "$file"
             echo -e "  ${GREEN}├─ [✓] Исправлены маркеры документа${NC}"
@@ -584,13 +631,25 @@ fix_file() {
         ((total_fixes++))
     fi
 
-    # New safe fixes (8-13)
-    fix_colon_spacing "$file" "$dry_run" && ((total_fixes++))
-    fix_empty_lines "$file" "$dry_run" && ((total_fixes++))
-    fix_eof_newline "$file" "$dry_run" && ((total_fixes++))
-    fix_bracket_spacing "$file" "$dry_run" && ((total_fixes++))
-    fix_comment_space "$file" "$dry_run" && ((total_fixes++))
-    fix_truthy_values "$file" "$dry_run" && ((total_fixes++))
+    # New safe fixes (8-13) - These functions internally check for issues
+    if should_fix "colon_spacing" "$allowed_fixes"; then
+        fix_colon_spacing "$file" "$dry_run" && ((total_fixes++))
+    fi
+    if should_fix "empty_lines" "$allowed_fixes"; then
+        fix_empty_lines "$file" "$dry_run" && ((total_fixes++))
+    fi
+    if should_fix "eof_newline" "$allowed_fixes"; then
+        fix_eof_newline "$file" "$dry_run" && ((total_fixes++))
+    fi
+    if should_fix "bracket_spacing" "$allowed_fixes"; then
+        fix_bracket_spacing "$file" "$dry_run" && ((total_fixes++))
+    fi
+    if should_fix "comment_space" "$allowed_fixes"; then
+        fix_comment_space "$file" "$dry_run" && ((total_fixes++))
+    fi
+    if should_fix "quotes" "$allowed_fixes"; then
+        fix_truthy_values "$file" "$dry_run" && ((total_fixes++))
+    fi
 
     # Interactive fixes
     if [[ $interactive -eq 1 ]]; then
@@ -644,7 +703,11 @@ find_and_fix_files() {
     echo ""
 
     for file in "${files[@]}"; do
-        fix_file "$file" "$backup" "$dry_run" "$interactive"
+        local allowed_fixes=""
+        if [[ -n "$FROM_REPORT" ]]; then
+            allowed_fixes=$(get_fixable_issues "$FROM_REPORT" "$file")
+        fi
+        fix_file "$file" "$backup" "$dry_run" "$interactive" "$allowed_fixes"
     done
 }
 
@@ -692,6 +755,7 @@ main() {
             -b|--backup) backup=1; shift ;;
             -n|--dry-run) dry_run=1; shift ;;
             -i|--interactive) INTERACTIVE=1; shift ;;
+            --from-report) FROM_REPORT="$2"; shift 2 ;;
             -v|--verbose) shift ;;  # Reserved for future use
             -*) echo "Неизвестная опция: $1"; usage ;;
             *) target_dir="$1"; shift ;;
@@ -708,6 +772,18 @@ main() {
         exit 1
     fi
 
+    # Validate report file if provided
+    if [[ -n "$FROM_REPORT" ]]; then
+        if [[ ! -f "$FROM_REPORT" ]]; then
+            echo -e "${RED}Ошибка: Файл отчета не найден: $FROM_REPORT${NC}"
+            exit 1
+        fi
+        if ! grep -q '"version"' "$FROM_REPORT" 2>/dev/null; then
+            echo -e "${RED}Ошибка: Некорректный формат JSON отчета: $FROM_REPORT${NC}"
+            exit 1
+        fi
+    fi
+
     print_header
 
     if [[ $dry_run -eq 1 ]]; then
@@ -720,6 +796,13 @@ main() {
         echo ""
     fi
 
+    if [[ -n "$FROM_REPORT" ]]; then
+        echo -e "${BLUE}${BOLD}РЕЖИМ: ИНТЕГРАЦИЯ С ОТЧЕТОМ ВАЛИДАТОРА${NC}"
+        echo -e "  Отчет: ${CYAN}$FROM_REPORT${NC}"
+        echo -e "  ${BOLD}Будут исправлены только проблемы из отчета${NC}"
+        echo ""
+    fi
+
     echo -e "${BOLD}Начинаю обработку YAML файлов...${NC}"
 
     # Handle both files and directories
@@ -728,7 +811,11 @@ main() {
         echo -e "Backup: ${CYAN}$([ $backup -eq 1 ] && echo "Да" || echo "Нет")${NC}"
         echo ""
 
-        fix_file "$target_dir" "$backup" "$dry_run" "$INTERACTIVE"
+        local allowed_fixes=""
+        if [[ -n "$FROM_REPORT" ]]; then
+            allowed_fixes=$(get_fixable_issues "$FROM_REPORT" "$target_dir")
+        fi
+        fix_file "$target_dir" "$backup" "$dry_run" "$INTERACTIVE" "$allowed_fixes"
     else
         echo -e "Директория: ${CYAN}$target_dir${NC}"
         echo -e "Режим: ${CYAN}$([ $recursive -eq 1 ] && echo "Рекурсивный" || echo "Только текущая директория")${NC}"

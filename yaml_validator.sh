@@ -63,6 +63,10 @@ STRICT_MODE=0
 CHECK_KEY_ORDERING=0      # A18: K8s key ordering convention
 CHECK_PARTIAL_SCHEMA=0    # C31-33: Partial type/enum validation
 
+# JSON output mode
+JSON_OUTPUT=0
+declare -a JSON_FILES=()   # Array to store JSON file objects
+
 # Reset severity counters for a new file
 reset_severity_counts() {
     SEVERITY_COUNTS[ERROR]=0
@@ -164,6 +168,141 @@ print_header() {
     echo -e "${NC}"
 }
 
+# ============================================================================
+# JSON Output Functions
+# ============================================================================
+
+# Current file's JSON issues array
+declare -a CURRENT_FILE_ISSUES=()
+CURRENT_JSON_FILE=""
+
+# Escape string for JSON
+json_escape() {
+    local str="$1"
+    str="${str//\\/\\\\}"   # Escape backslashes first
+    str="${str//\"/\\\"}"   # Escape quotes
+    str="${str//$'\n'/\\n}" # Escape newlines
+    str="${str//$'\r'/}"    # Remove CR
+    str="${str//$'\t'/\\t}" # Escape tabs
+    echo "$str"
+}
+
+# Start JSON entry for a file
+json_start_file() {
+    local file="$1"
+    CURRENT_JSON_FILE="$file"
+    CURRENT_FILE_ISSUES=()
+}
+
+# Add issue to current file's JSON
+# Usage: json_add_issue LINE SEVERITY CATEGORY CODE MESSAGE [FIXABLE] [FIX_TYPE]
+json_add_issue() {
+    local line="$1"
+    local severity="$2"
+    local category="$3"
+    local code="$4"
+    local message="$5"
+    local fixable="${6:-false}"
+    local fix_type="${7:-}"
+
+    # Escape message for JSON
+    message=$(json_escape "$message")
+
+    local issue="{\"line\":$line,\"severity\":\"$severity\",\"category\":\"$category\",\"code\":\"$code\",\"message\":\"$message\",\"fixable\":$fixable"
+    if [[ -n "$fix_type" ]]; then
+        issue+=",\"fix_type\":\"$fix_type\""
+    fi
+    issue+="}"
+
+    CURRENT_FILE_ISSUES+=("$issue")
+}
+
+# End file JSON entry and add to global array
+json_end_file() {
+    local file_path
+    file_path=$(json_escape "$CURRENT_JSON_FILE")
+
+    local issues_json=""
+    if [[ ${#CURRENT_FILE_ISSUES[@]} -gt 0 ]]; then
+        issues_json=$(IFS=,; echo "${CURRENT_FILE_ISSUES[*]}")
+    fi
+
+    local file_json="{\"path\":\"$file_path\",\"issues\":[$issues_json]}"
+    JSON_FILES+=("$file_json")
+}
+
+# Parse text errors and add to JSON
+# Usage: parse_errors_to_json "CATEGORY" "CODE" "SEVERITY" "errors_text" [fixable] [fix_type]
+parse_errors_to_json() {
+    [[ $JSON_OUTPUT -eq 0 ]] && return
+
+    local category="$1"
+    local code="$2"
+    local severity="$3"
+    local errors_text="$4"
+    local fixable="${5:-false}"
+    local fix_type="${6:-}"
+
+    [[ -z "$errors_text" ]] && return
+
+    # Parse each line looking for "Строка N:" pattern
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        [[ "$line" == "==="* ]] && continue  # Skip headers
+
+        local line_num=0
+        local message="$line"
+
+        # Try to extract line number from various formats
+        if [[ "$line" =~ Строка[[:space:]]+([0-9]+) ]]; then
+            line_num="${BASH_REMATCH[1]}"
+            # Remove "Строка N: " prefix from message
+            message="${line#*: }"
+        elif [[ "$line" =~ ^\[.*\][[:space:]]*Строка[[:space:]]+([0-9]+) ]]; then
+            line_num="${BASH_REMATCH[1]}"
+            message="${line#*: }"
+        fi
+
+        json_add_issue "$line_num" "$severity" "$category" "$code" "$message" "$fixable" "$fix_type"
+    done <<< "$errors_text"
+}
+
+# Output final JSON report
+output_json_report() {
+    local output_file="$1"
+
+    local timestamp
+    timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+    local files_json=""
+    if [[ ${#JSON_FILES[@]} -gt 0 ]]; then
+        files_json=$(IFS=,; echo "${JSON_FILES[*]}")
+    fi
+
+    local json_output="{
+  \"version\": \"2.8.0\",
+  \"timestamp\": \"$timestamp\",
+  \"security_mode\": \"$SECURITY_MODE\",
+  \"strict_mode\": $( [[ $STRICT_MODE -eq 1 ]] && echo "true" || echo "false" ),
+  \"summary\": {
+    \"total_files\": $TOTAL_FILES,
+    \"passed\": $PASSED_FILES,
+    \"failed\": $FAILED_FILES,
+    \"errors\": ${TOTAL_SEVERITY_COUNTS[ERROR]},
+    \"warnings\": ${TOTAL_SEVERITY_COUNTS[WARNING]},
+    \"info\": ${TOTAL_SEVERITY_COUNTS[INFO]},
+    \"security\": ${TOTAL_SEVERITY_COUNTS[SECURITY]}
+  },
+  \"files\": [$files_json]
+}"
+
+    if [[ -n "$output_file" ]]; then
+        echo "$json_output" > "$output_file"
+    else
+        echo "$json_output"
+    fi
+}
+
 usage() {
     cat << EOF
 Использование: $0 [ОПЦИИ] <файл_или_директория>
@@ -180,6 +319,7 @@ usage() {
     --key-ordering          Включить проверку порядка ключей K8s (A18)
     --partial-schema        Включить частичную проверку типов (C31-C33)
     --all-checks            Включить все опциональные проверки
+    --json                  Вывод в JSON формате (для интеграции с fix_yaml_issues.sh)
     -h, --help              Показать эту справку
 
 Уровни серьёзности:
@@ -5807,182 +5947,201 @@ validate_yaml_file() {
     # Reset severity counters for this file
     reset_severity_counts
 
-    echo -e "${BLUE}[ПРОВЕРЯЮ]${NC} $file"
+    [[ $JSON_OUTPUT -eq 0 ]] && echo -e "${BLUE}[ПРОВЕРЯЮ]${NC} $file"
 
     # Critical checks first
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка BOM (Byte Order Mark)...${NC}"
     fi
     local bom_errors
     if ! bom_errors=$(check_bom "$file"); then
         file_errors+=("=== КРИТИЧЕСКАЯ ОШИБКА: BOM ===")
         file_errors+=("$bom_errors")
+        parse_errors_to_json "encoding" "BOM" "ERROR" "$bom_errors" "true" "bom"
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка на пустой файл...${NC}"
     fi
     local empty_errors
     if ! empty_errors=$(check_empty_file "$file"); then
         file_errors+=("$empty_errors")
+        parse_errors_to_json "structure" "EMPTY_FILE" "ERROR" "$empty_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка кодировки Windows (CRLF)...${NC}"
     fi
     local encoding_errors
     if ! encoding_errors=$(check_windows_encoding "$file"); then
         file_errors+=("=== ОШИБКИ КОДИРОВКИ ===")
         file_errors+=("$encoding_errors")
+        parse_errors_to_json "encoding" "CRLF" "ERROR" "$encoding_errors" "true" "crlf"
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка табов...${NC}"
     fi
     local tab_errors
     if ! tab_errors=$(check_tabs "$file"); then
         file_errors+=("=== ОШИБКИ ТАБОВ ===")
         file_errors+=("$tab_errors")
+        parse_errors_to_json "formatting" "TABS" "ERROR" "$tab_errors" "true" "tabs"
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка пробелов в конце строк...${NC}"
     fi
     local trailing_errors
     if ! trailing_errors=$(check_trailing_whitespace "$file"); then
         file_errors+=("=== ПРЕДУПРЕЖДЕНИЯ: TRAILING WHITESPACE ===")
         file_errors+=("$trailing_errors")
+        parse_errors_to_json "formatting" "TRAILING_WHITESPACE" "WARNING" "$trailing_errors" "true" "trailing"
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка отступов...${NC}"
     fi
     local indent_errors
     if ! indent_errors=$(check_indentation "$file"); then
         file_errors+=("=== ОШИБКИ ОТСТУПОВ ===")
         file_errors+=("$indent_errors")
+        parse_errors_to_json "formatting" "INDENTATION" "ERROR" "$indent_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка синтаксиса и скобок...${NC}"
     fi
     local syntax_errors
     if ! syntax_errors=$(check_basic_syntax "$file"); then
         file_errors+=("=== ОШИБКИ СИНТАКСИСА ===")
         file_errors+=("$syntax_errors")
+        parse_errors_to_json "syntax" "BRACKETS" "ERROR" "$syntax_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка пустых ключей...${NC}"
     fi
     local empty_key_errors
     if ! empty_key_errors=$(check_empty_keys "$file"); then
         file_errors+=("=== ОШИБКИ ПУСТЫХ КЛЮЧЕЙ ===")
         file_errors+=("$empty_key_errors")
+        parse_errors_to_json "structure" "EMPTY_KEYS" "ERROR" "$empty_key_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка дубликатов ключей...${NC}"
     fi
     local duplicate_errors
     if ! duplicate_errors=$(check_duplicate_keys "$file"); then
         file_errors+=("=== ОШИБКИ ДУБЛИКАТОВ КЛЮЧЕЙ ===")
         file_errors+=("$duplicate_errors")
+        parse_errors_to_json "structure" "DUPLICATE_KEYS" "ERROR" "$duplicate_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка специальных значений (yes/no/on/off)...${NC}"
     fi
     local special_value_errors
     if ! special_value_errors=$(check_special_values "$file"); then
         file_errors+=("=== ПРЕДУПРЕЖДЕНИЯ: СПЕЦИАЛЬНЫЕ ЗНАЧЕНИЯ ===")
         file_errors+=("$special_value_errors")
+        parse_errors_to_json "yaml" "SPECIAL_VALUES" "WARNING" "$special_value_errors" "true" "quotes"
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка маркеров документа (---, ...)...${NC}"
     fi
     local marker_errors
     if ! marker_errors=$(check_document_markers "$file"); then
         file_errors+=("=== ОШИБКИ МАРКЕРОВ ДОКУМЕНТА ===")
         file_errors+=("$marker_errors")
+        parse_errors_to_json "structure" "DOCUMENT_MARKERS" "ERROR" "$marker_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка формата Kubernetes меток...${NC}"
     fi
     local label_errors
     if ! label_errors=$(check_label_format "$file"); then
         file_errors+=("=== KUBERNETES: ФОРМАТ МЕТОК ===")
         file_errors+=("$label_errors")
+        parse_errors_to_json "kubernetes" "LABEL_FORMAT" "ERROR" "$label_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка YAML anchors/aliases...${NC}"
     fi
     local anchor_errors
     if ! anchor_errors=$(check_anchors_aliases "$file"); then
         file_errors+=("=== ОШИБКИ YAML ANCHORS/ALIASES ===")
         file_errors+=("$anchor_errors")
+        parse_errors_to_json "yaml" "ANCHORS_ALIASES" "ERROR" "$anchor_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка Kubernetes полей и опечаток...${NC}"
     fi
     local k8s_errors
     if ! k8s_errors=$(check_kubernetes_specific "$file"); then
         file_errors+=("=== KUBERNETES: РАСШИРЕННАЯ ПРОВЕРКА ===")
         file_errors+=("$k8s_errors")
+        parse_errors_to_json "kubernetes" "TYPOS" "ERROR" "$k8s_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка base64 в Secrets...${NC}"
     fi
     local base64_errors
     if ! base64_errors=$(check_base64_in_secrets "$file"); then
         file_errors+=("=== KUBERNETES: ВАЛИДАЦИЯ BASE64 ===")
         file_errors+=("$base64_errors")
+        parse_errors_to_json "kubernetes" "BASE64" "ERROR" "$base64_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка числовых форматов (octal, hex)...${NC}"
     fi
     local numeric_errors
     if ! numeric_errors=$(check_numeric_formats "$file"); then
         file_errors+=("=== ИНФОРМАЦИЯ: ЧИСЛОВЫЕ ФОРМАТЫ ===")
         file_errors+=("$numeric_errors")
+        parse_errors_to_json "yaml" "NUMERIC_FORMAT" "INFO" "$numeric_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка resource quantities (cpu, memory)...${NC}"
     fi
     local resource_errors
     if ! resource_errors=$(check_resource_quantities "$file"); then
         file_errors+=("=== KUBERNETES: RESOURCE QUANTITIES ===")
         file_errors+=("$resource_errors")
+        parse_errors_to_json "kubernetes" "RESOURCE_QUANTITIES" "ERROR" "$resource_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка диапазонов портов...${NC}"
     fi
     local port_errors
     if ! port_errors=$(check_port_ranges "$file"); then
         file_errors+=("=== KUBERNETES: ВАЛИДАЦИЯ ПОРТОВ ===")
         file_errors+=("$port_errors")
+        parse_errors_to_json "kubernetes" "PORT_RANGES" "ERROR" "$port_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка multiline блоков (|, >)...${NC}"
     fi
     local multiline_errors
     if ! multiline_errors=$(check_multiline_blocks "$file"); then
         file_errors+=("=== YAML: MULTILINE БЛОКИ ===")
         file_errors+=("$multiline_errors")
+        parse_errors_to_json "yaml" "MULTILINE_BLOCKS" "ERROR" "$multiline_errors" "false" ""
     fi
 
     # === NEW CHECKS v2.3.0 ===
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка sexagesimal (21:00 = 1260)...${NC}"
     fi
     local sexagesimal_warnings
@@ -5990,9 +6149,10 @@ validate_yaml_file() {
     if [[ -n "$sexagesimal_warnings" ]]; then
         file_errors+=("=== YAML 1.1: SEXAGESIMAL ===")
         file_errors+=("$sexagesimal_warnings")
+        parse_errors_to_json "yaml" "SEXAGESIMAL" "WARNING" "$sexagesimal_warnings" "true" "quotes"
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка Norway Problem (y/n/NO)...${NC}"
     fi
     local norway_warnings
@@ -6000,18 +6160,20 @@ validate_yaml_file() {
     if [[ -n "$norway_warnings" ]]; then
         file_errors+=("=== YAML 1.1: NORWAY PROBLEM ===")
         file_errors+=("$norway_warnings")
+        parse_errors_to_json "yaml" "NORWAY_PROBLEM" "WARNING" "$norway_warnings" "true" "quotes"
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка YAML Bomb (Billion Laughs)...${NC}"
     fi
     local bomb_errors
     if ! bomb_errors=$(check_yaml_bomb "$file"); then
         file_errors+=("=== БЕЗОПАСНОСТЬ: YAML BOMB ===")
         file_errors+=("$bomb_errors")
+        parse_errors_to_json "security" "YAML_BOMB" "SECURITY" "$bomb_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка кавычек для спецсимволов...${NC}"
     fi
     local quoting_warnings
@@ -6019,27 +6181,30 @@ validate_yaml_file() {
     if [[ -n "$quoting_warnings" ]]; then
         file_errors+=("=== YAML: КАВЫЧКИ ===")
         file_errors+=("$quoting_warnings")
+        parse_errors_to_json "yaml" "QUOTING" "WARNING" "$quoting_warnings" "true" "quotes"
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка imagePullPolicy...${NC}"
     fi
     local pullpolicy_errors
     if ! pullpolicy_errors=$(check_image_pull_policy "$file"); then
         file_errors+=("=== KUBERNETES: IMAGEPULLPOLICY ===")
         file_errors+=("$pullpolicy_errors")
+        parse_errors_to_json "kubernetes" "IMAGE_PULL_POLICY" "ERROR" "$pullpolicy_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка replicas (тип данных)...${NC}"
     fi
     local replicas_errors
     if ! replicas_errors=$(check_replicas_type "$file"); then
         file_errors+=("=== KUBERNETES: REPLICAS ===")
         file_errors+=("$replicas_errors")
+        parse_errors_to_json "kubernetes" "REPLICAS_TYPE" "ERROR" "$replicas_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка image tags (:latest)...${NC}"
     fi
     local imagetag_warnings
@@ -6047,18 +6212,20 @@ validate_yaml_file() {
     if [[ -n "$imagetag_warnings" ]]; then
         file_errors+=("=== KUBERNETES: IMAGE TAGS ===")
         file_errors+=("$imagetag_warnings")
+        parse_errors_to_json "kubernetes" "IMAGE_TAGS" "WARNING" "$imagetag_warnings" "false" ""
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка длины labels/annotations...${NC}"
     fi
     local length_errors
     if ! length_errors=$(check_annotation_length "$file"); then
         file_errors+=("=== KUBERNETES: LABEL/ANNOTATION LENGTH ===")
         file_errors+=("$length_errors")
+        parse_errors_to_json "kubernetes" "ANNOTATION_LENGTH" "ERROR" "$length_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка securityContext...${NC}"
     fi
     local security_warnings
@@ -6066,9 +6233,10 @@ validate_yaml_file() {
     if [[ -n "$security_warnings" ]]; then
         file_errors+=("=== БЕЗОПАСНОСТЬ: SECURITY CONTEXT ===")
         file_errors+=("$security_warnings")
+        parse_errors_to_json "security" "SECURITY_CONTEXT" "SECURITY" "$security_warnings" "false" ""
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка probe config...${NC}"
     fi
     local probe_warnings
@@ -6076,38 +6244,42 @@ validate_yaml_file() {
     if [[ -n "$probe_warnings" ]]; then
         file_errors+=("=== KUBERNETES: PROBES ===")
         file_errors+=("$probe_warnings")
+        parse_errors_to_json "kubernetes" "PROBE_CONFIG" "WARNING" "$probe_warnings" "false" ""
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка restartPolicy...${NC}"
     fi
     local restart_errors
     if ! restart_errors=$(check_restart_policy "$file"); then
         file_errors+=("=== KUBERNETES: RESTARTPOLICY ===")
         file_errors+=("$restart_errors")
+        parse_errors_to_json "kubernetes" "RESTART_POLICY" "ERROR" "$restart_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка Service type...${NC}"
     fi
     local svctype_errors
     if ! svctype_errors=$(check_service_type "$file"); then
         file_errors+=("=== KUBERNETES: SERVICE TYPE ===")
         file_errors+=("$svctype_errors")
+        parse_errors_to_json "kubernetes" "SERVICE_TYPE" "ERROR" "$svctype_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка Deckhouse CRD...${NC}"
     fi
     local deckhouse_errors
     if ! deckhouse_errors=$(check_deckhouse_crd "$file"); then
         file_errors+=("=== DECKHOUSE: CRD VALIDATION ===")
         file_errors+=("$deckhouse_errors")
+        parse_errors_to_json "kubernetes" "DECKHOUSE_CRD" "ERROR" "$deckhouse_errors" "false" ""
     fi
 
     # === NEW CHECKS v2.4.0 ===
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка deprecated API versions...${NC}"
     fi
     local deprecated_api_warnings
@@ -6115,36 +6287,40 @@ validate_yaml_file() {
     if [[ -n "$deprecated_api_warnings" ]]; then
         file_errors+=("=== KUBERNETES: DEPRECATED API ===")
         file_errors+=("$deprecated_api_warnings")
+        parse_errors_to_json "kubernetes" "DEPRECATED_API" "WARNING" "$deprecated_api_warnings" "false" ""
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка selector/template labels...${NC}"
     fi
     local selector_errors
     if ! selector_errors=$(check_selector_match "$file"); then
         file_errors+=("=== KUBERNETES: SELECTOR MISMATCH ===")
         file_errors+=("$selector_errors")
+        parse_errors_to_json "kubernetes" "SELECTOR_MISMATCH" "ERROR" "$selector_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка environment variables...${NC}"
     fi
     local env_errors
     if ! env_errors=$(check_env_vars "$file"); then
         file_errors+=("=== KUBERNETES: ENV VARS ===")
         file_errors+=("$env_errors")
+        parse_errors_to_json "kubernetes" "ENV_VARS" "ERROR" "$env_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка DNS names (RFC 1123)...${NC}"
     fi
     local dns_errors
     if ! dns_errors=$(check_dns_names "$file"); then
         file_errors+=("=== KUBERNETES: DNS NAMES ===")
         file_errors+=("$dns_errors")
+        parse_errors_to_json "kubernetes" "DNS_NAMES" "ERROR" "$dns_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка null values...${NC}"
     fi
     local null_warnings
@@ -6152,27 +6328,30 @@ validate_yaml_file() {
     if [[ -n "$null_warnings" ]]; then
         file_errors+=("=== YAML: NULL VALUES ===")
         file_errors+=("$null_warnings")
+        parse_errors_to_json "yaml" "NULL_VALUES" "WARNING" "$null_warnings" "false" ""
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка flow style (inline JSON)...${NC}"
     fi
     local flow_errors
     if ! flow_errors=$(check_flow_style "$file"); then
         file_errors+=("=== YAML: FLOW STYLE ===")
         file_errors+=("$flow_errors")
+        parse_errors_to_json "yaml" "FLOW_STYLE" "ERROR" "$flow_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка container names...${NC}"
     fi
     local container_name_errors
     if ! container_name_errors=$(check_container_name "$file"); then
         file_errors+=("=== KUBERNETES: CONTAINER NAMES ===")
         file_errors+=("$container_name_errors")
+        parse_errors_to_json "kubernetes" "CONTAINER_NAMES" "ERROR" "$container_name_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка security best practices...${NC}"
     fi
     local security_bp_warnings
@@ -6180,18 +6359,20 @@ validate_yaml_file() {
     if [[ -n "$security_bp_warnings" ]]; then
         file_errors+=("=== БЕЗОПАСНОСТЬ: BEST PRACTICES ===")
         file_errors+=("$security_bp_warnings")
+        parse_errors_to_json "security" "BEST_PRACTICES" "SECURITY" "$security_bp_warnings" "false" ""
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка resource format (cpu/memory)...${NC}"
     fi
     local resource_fmt_errors
     if ! resource_fmt_errors=$(check_resource_format "$file"); then
         file_errors+=("=== KUBERNETES: RESOURCE FORMAT ===")
         file_errors+=("$resource_fmt_errors")
+        parse_errors_to_json "kubernetes" "RESOURCE_FORMAT" "ERROR" "$resource_fmt_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка Service selector...${NC}"
     fi
     local svc_selector_warnings
@@ -6199,65 +6380,72 @@ validate_yaml_file() {
     if [[ -n "$svc_selector_warnings" ]]; then
         file_errors+=("=== KUBERNETES: SERVICE SELECTOR ===")
         file_errors+=("$svc_selector_warnings")
+        parse_errors_to_json "kubernetes" "SERVICE_SELECTOR" "WARNING" "$svc_selector_warnings" "false" ""
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка volume mounts (CVE-2023-3676)...${NC}"
     fi
     local volume_errors
     if ! volume_errors=$(check_volume_mounts "$file"); then
         file_errors+=("=== БЕЗОПАСНОСТЬ: VOLUME MOUNTS ===")
         file_errors+=("$volume_errors")
+        parse_errors_to_json "security" "VOLUME_MOUNTS" "SECURITY" "$volume_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка ConfigMap keys...${NC}"
     fi
     local cm_key_errors
     if ! cm_key_errors=$(check_configmap_keys "$file"); then
         file_errors+=("=== KUBERNETES: CONFIGMAP KEYS ===")
         file_errors+=("$cm_key_errors")
+        parse_errors_to_json "kubernetes" "CONFIGMAP_KEYS" "ERROR" "$cm_key_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка Ingress rules...${NC}"
     fi
     local ingress_errors
     if ! ingress_errors=$(check_ingress_rules "$file"); then
         file_errors+=("=== KUBERNETES: INGRESS ===")
         file_errors+=("$ingress_errors")
+        parse_errors_to_json "kubernetes" "INGRESS_RULES" "ERROR" "$ingress_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка HPA config...${NC}"
     fi
     local hpa_errors
     if ! hpa_errors=$(check_hpa_config "$file"); then
         file_errors+=("=== KUBERNETES: HPA ===")
         file_errors+=("$hpa_errors")
+        parse_errors_to_json "kubernetes" "HPA_CONFIG" "ERROR" "$hpa_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка PodDisruptionBudget...${NC}"
     fi
     local pdb_errors
     if ! pdb_errors=$(check_pdb_config "$file"); then
         file_errors+=("=== KUBERNETES: PDB ===")
         file_errors+=("$pdb_errors")
+        parse_errors_to_json "kubernetes" "PDB_CONFIG" "ERROR" "$pdb_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка CronJob schedule...${NC}"
     fi
     local cronjob_errors
     if ! cronjob_errors=$(check_cronjob_schedule "$file"); then
         file_errors+=("=== KUBERNETES: CRONJOB ===")
         file_errors+=("$cronjob_errors")
+        parse_errors_to_json "kubernetes" "CRONJOB_SCHEDULE" "ERROR" "$cronjob_errors" "false" ""
     fi
 
     # === NEW CHECKS v2.5.0 ===
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка timestamp/date values...${NC}"
     fi
     local timestamp_warnings
@@ -6265,9 +6453,10 @@ validate_yaml_file() {
     if [[ -n "$timestamp_warnings" ]]; then
         file_errors+=("=== YAML: TIMESTAMP VALUES ===")
         file_errors+=("$timestamp_warnings")
+        parse_errors_to_json "yaml" "TIMESTAMP_VALUES" "WARNING" "$timestamp_warnings" "true" "quotes"
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка version numbers...${NC}"
     fi
     local version_warnings
@@ -6275,18 +6464,20 @@ validate_yaml_file() {
     if [[ -n "$version_warnings" ]]; then
         file_errors+=("=== YAML: VERSION NUMBERS ===")
         file_errors+=("$version_warnings")
+        parse_errors_to_json "yaml" "VERSION_NUMBERS" "WARNING" "$version_warnings" "true" "quotes"
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка merge keys (<<:)...${NC}"
     fi
     local merge_errors
     if ! merge_errors=$(check_merge_keys "$file"); then
         file_errors+=("=== YAML: MERGE KEYS ===")
         file_errors+=("$merge_errors")
+        parse_errors_to_json "yaml" "MERGE_KEYS" "ERROR" "$merge_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка implicit type coercion...${NC}"
     fi
     local implicit_warnings
@@ -6294,20 +6485,22 @@ validate_yaml_file() {
     if [[ -n "$implicit_warnings" ]]; then
         file_errors+=("=== YAML: IMPLICIT TYPES ===")
         file_errors+=("$implicit_warnings")
+        parse_errors_to_json "yaml" "IMPLICIT_TYPES" "WARNING" "$implicit_warnings" "true" "quotes"
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка embedded JSON...${NC}"
     fi
     local json_errors
     if ! json_errors=$(check_embedded_json "$file"); then
         file_errors+=("=== YAML: EMBEDDED JSON ===")
         file_errors+=("$json_errors")
+        parse_errors_to_json "yaml" "EMBEDDED_JSON" "ERROR" "$json_errors" "false" ""
     fi
 
     # === B17-B20: Additional YAML Semantics Checks (v2.7.0) ===
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка float без ведущего нуля...${NC}"
     fi
     local float_warnings
@@ -6315,9 +6508,10 @@ validate_yaml_file() {
     if [[ -n "$float_warnings" ]]; then
         file_errors+=("=== YAML: FLOAT LEADING ZERO ===")
         file_errors+=("$float_warnings")
+        parse_errors_to_json "yaml" "FLOAT_LEADING_ZERO" "WARNING" "$float_warnings" "false" ""
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка NaN/Infinity...${NC}"
     fi
     local special_float_warnings
@@ -6325,9 +6519,10 @@ validate_yaml_file() {
     if [[ -n "$special_float_warnings" ]]; then
         file_errors+=("=== YAML: SPECIAL FLOATS ===")
         file_errors+=("$special_float_warnings")
+        parse_errors_to_json "yaml" "SPECIAL_FLOATS" "WARNING" "$special_float_warnings" "false" ""
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка глубины вложенности...${NC}"
     fi
     local nesting_warnings
@@ -6335,9 +6530,10 @@ validate_yaml_file() {
     if [[ -n "$nesting_warnings" ]]; then
         file_errors+=("=== YAML: NESTING DEPTH ===")
         file_errors+=("$nesting_warnings")
+        parse_errors_to_json "yaml" "NESTING_DEPTH" "WARNING" "$nesting_warnings" "false" ""
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка Unicode...${NC}"
     fi
     local unicode_warnings
@@ -6345,18 +6541,20 @@ validate_yaml_file() {
     if [[ -n "$unicode_warnings" ]]; then
         file_errors+=("=== YAML: UNICODE ISSUES ===")
         file_errors+=("$unicode_warnings")
+        parse_errors_to_json "yaml" "UNICODE_ISSUES" "WARNING" "$unicode_warnings" "false" ""
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка network values...${NC}"
     fi
     local network_errors
     if ! network_errors=$(check_network_values "$file"); then
         file_errors+=("=== KUBERNETES: NETWORK VALUES ===")
         file_errors+=("$network_errors")
+        parse_errors_to_json "kubernetes" "NETWORK_VALUES" "ERROR" "$network_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка key naming...${NC}"
     fi
     local naming_warnings
@@ -6364,11 +6562,12 @@ validate_yaml_file() {
     if [[ -n "$naming_warnings" ]]; then
         file_errors+=("=== YAML: KEY NAMING ===")
         file_errors+=("$naming_warnings")
+        parse_errors_to_json "yaml" "KEY_NAMING" "WARNING" "$naming_warnings" "false" ""
     fi
 
     # === NEW CHECKS v2.6.0 - PSS SECURITY ===
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка PSS Baseline...${NC}"
     fi
     local pss_baseline_warnings
@@ -6376,9 +6575,10 @@ validate_yaml_file() {
     if [[ -n "$pss_baseline_warnings" ]]; then
         file_errors+=("=== БЕЗОПАСНОСТЬ: PSS BASELINE ===")
         file_errors+=("$pss_baseline_warnings")
+        parse_errors_to_json "security" "PSS_BASELINE" "SECURITY" "$pss_baseline_warnings" "false" ""
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка PSS Restricted...${NC}"
     fi
     local pss_restricted_warnings
@@ -6386,9 +6586,10 @@ validate_yaml_file() {
     if [[ -n "$pss_restricted_warnings" ]]; then
         file_errors+=("=== БЕЗОПАСНОСТЬ: PSS RESTRICTED ===")
         file_errors+=("$pss_restricted_warnings")
+        parse_errors_to_json "security" "PSS_RESTRICTED" "SECURITY" "$pss_restricted_warnings" "false" ""
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка sensitive mounts...${NC}"
     fi
     local sensitive_mount_warnings
@@ -6396,10 +6597,11 @@ validate_yaml_file() {
     if [[ -n "$sensitive_mount_warnings" ]]; then
         file_errors+=("=== БЕЗОПАСНОСТЬ: SENSITIVE MOUNTS ===")
         file_errors+=("$sensitive_mount_warnings")
+        parse_errors_to_json "security" "SENSITIVE_MOUNTS" "SECURITY" "$sensitive_mount_warnings" "false" ""
     fi
 
     # === D20: Writable hostPath (v2.7.0) ===
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка writable hostPath...${NC}"
     fi
     local writable_hostpath_warnings
@@ -6407,10 +6609,11 @@ validate_yaml_file() {
     if [[ -n "$writable_hostpath_warnings" ]]; then
         file_errors+=("=== БЕЗОПАСНОСТЬ: WRITABLE HOSTPATH ===")
         file_errors+=("$writable_hostpath_warnings")
+        parse_errors_to_json "security" "WRITABLE_HOSTPATH" "SECURITY" "$writable_hostpath_warnings" "false" ""
     fi
 
     # === D23: drop NET_RAW capability (v2.7.0) ===
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка drop NET_RAW...${NC}"
     fi
     local net_raw_warnings
@@ -6418,9 +6621,10 @@ validate_yaml_file() {
     if [[ -n "$net_raw_warnings" ]]; then
         file_errors+=("=== БЕЗОПАСНОСТЬ: DROP NET_RAW ===")
         file_errors+=("$net_raw_warnings")
+        parse_errors_to_json "security" "DROP_NET_RAW" "SECURITY" "$net_raw_warnings" "false" ""
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка privileged ports...${NC}"
     fi
     local priv_port_warnings
@@ -6428,9 +6632,10 @@ validate_yaml_file() {
     if [[ -n "$priv_port_warnings" ]]; then
         file_errors+=("=== БЕЗОПАСНОСТЬ: PRIVILEGED PORTS ===")
         file_errors+=("$priv_port_warnings")
+        parse_errors_to_json "security" "PRIVILEGED_PORTS" "SECURITY" "$priv_port_warnings" "false" ""
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка RBAC security...${NC}"
     fi
     local rbac_warnings
@@ -6438,9 +6643,10 @@ validate_yaml_file() {
     if [[ -n "$rbac_warnings" ]]; then
         file_errors+=("=== БЕЗОПАСНОСТЬ: RBAC ===")
         file_errors+=("$rbac_warnings")
+        parse_errors_to_json "security" "RBAC_SECURITY" "SECURITY" "$rbac_warnings" "false" ""
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка secrets in env...${NC}"
     fi
     local secrets_env_warnings
@@ -6448,9 +6654,10 @@ validate_yaml_file() {
     if [[ -n "$secrets_env_warnings" ]]; then
         file_errors+=("=== БЕЗОПАСНОСТЬ: SECRETS IN ENV ===")
         file_errors+=("$secrets_env_warnings")
+        parse_errors_to_json "security" "SECRETS_IN_ENV" "SECURITY" "$secrets_env_warnings" "false" ""
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка default ServiceAccount...${NC}"
     fi
     local default_sa_warnings
@@ -6458,11 +6665,12 @@ validate_yaml_file() {
     if [[ -n "$default_sa_warnings" ]]; then
         file_errors+=("=== БЕЗОПАСНОСТЬ: SERVICE ACCOUNT ===")
         file_errors+=("$default_sa_warnings")
+        parse_errors_to_json "security" "DEFAULT_SERVICE_ACCOUNT" "SECURITY" "$default_sa_warnings" "false" ""
     fi
 
     # === YAMLLINT-COMPATIBLE CHECKS v2.6.0 ===
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка длины строк...${NC}"
     fi
     local line_length_warnings
@@ -6470,9 +6678,10 @@ validate_yaml_file() {
     if [[ -n "$line_length_warnings" ]]; then
         file_errors+=("=== СТИЛЬ: LINE LENGTH ===")
         file_errors+=("$line_length_warnings")
+        parse_errors_to_json "style" "LINE_LENGTH" "INFO" "$line_length_warnings" "false" ""
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка формата комментариев...${NC}"
     fi
     local comment_warnings
@@ -6480,9 +6689,10 @@ validate_yaml_file() {
     if [[ -n "$comment_warnings" ]]; then
         file_errors+=("=== СТИЛЬ: COMMENTS ===")
         file_errors+=("$comment_warnings")
+        parse_errors_to_json "style" "COMMENT_FORMAT" "INFO" "$comment_warnings" "false" ""
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка отступов комментариев...${NC}"
     fi
     local comment_indent_warnings
@@ -6490,9 +6700,10 @@ validate_yaml_file() {
     if [[ -n "$comment_indent_warnings" ]]; then
         file_errors+=("=== СТИЛЬ: COMMENT INDENTATION ===")
         file_errors+=("$comment_indent_warnings")
+        parse_errors_to_json "style" "COMMENT_INDENTATION" "INFO" "$comment_indent_warnings" "false" ""
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка пустых строк...${NC}"
     fi
     local empty_line_warnings
@@ -6500,9 +6711,10 @@ validate_yaml_file() {
     if [[ -n "$empty_line_warnings" ]]; then
         file_errors+=("=== СТИЛЬ: EMPTY LINES ===")
         file_errors+=("$empty_line_warnings")
+        parse_errors_to_json "style" "EMPTY_LINES" "INFO" "$empty_line_warnings" "true" "empty_lines"
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка newline в конце файла...${NC}"
     fi
     local eof_warnings
@@ -6510,9 +6722,10 @@ validate_yaml_file() {
     if [[ -n "$eof_warnings" ]]; then
         file_errors+=("=== СТИЛЬ: NEWLINE AT EOF ===")
         file_errors+=("$eof_warnings")
+        parse_errors_to_json "style" "NEWLINE_EOF" "INFO" "$eof_warnings" "true" "eof_newline"
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка пробелов у двоеточий...${NC}"
     fi
     local colon_warnings
@@ -6520,9 +6733,10 @@ validate_yaml_file() {
     if [[ -n "$colon_warnings" ]]; then
         file_errors+=("=== СТИЛЬ: COLONS SPACING ===")
         file_errors+=("$colon_warnings")
+        parse_errors_to_json "style" "COLONS_SPACING" "INFO" "$colon_warnings" "true" "colons"
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка пробелов в скобках...${NC}"
     fi
     local bracket_warnings
@@ -6530,9 +6744,10 @@ validate_yaml_file() {
     if [[ -n "$bracket_warnings" ]]; then
         file_errors+=("=== СТИЛЬ: BRACKETS SPACING ===")
         file_errors+=("$bracket_warnings")
+        parse_errors_to_json "style" "BRACKETS_SPACING" "INFO" "$bracket_warnings" "false" ""
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}└─ Проверка truthy values...${NC}"
     fi
     local truthy_warnings
@@ -6540,6 +6755,7 @@ validate_yaml_file() {
     if [[ -n "$truthy_warnings" ]]; then
         file_errors+=("=== YAML: TRUTHY VALUES ===")
         file_errors+=("$truthy_warnings")
+        parse_errors_to_json "yaml" "TRUTHY_VALUES" "WARNING" "$truthy_warnings" "true" "quotes"
     fi
 
     # A18: K8s key ordering (optional)
@@ -6552,6 +6768,7 @@ validate_yaml_file() {
         if [[ -n "$key_order_warnings" ]]; then
             file_errors+=("=== СТИЛЬ: KEY ORDERING ===")
             file_errors+=("$key_order_warnings")
+            parse_errors_to_json "style" "KEY_ORDERING" "INFO" "$key_order_warnings" "false" ""
         fi
     fi
 
@@ -6565,6 +6782,7 @@ validate_yaml_file() {
         if [[ -n "$field_type_errors" ]]; then
             file_errors+=("=== СХЕМА: FIELD TYPES ===")
             file_errors+=("$field_type_errors")
+            parse_errors_to_json "schema" "FIELD_TYPES" "ERROR" "$field_type_errors" "false" ""
         fi
 
         if [[ $verbose -eq 1 ]]; then
@@ -6575,6 +6793,7 @@ validate_yaml_file() {
         if [[ -n "$enum_errors" ]]; then
             file_errors+=("=== СХЕМА: ENUM VALUES ===")
             file_errors+=("$enum_errors")
+            parse_errors_to_json "schema" "ENUM_VALUES" "ERROR" "$enum_errors" "false" ""
         fi
 
         if [[ $verbose -eq 1 ]]; then
@@ -6585,11 +6804,12 @@ validate_yaml_file() {
         if [[ -n "$required_errors" ]]; then
             file_errors+=("=== СХЕМА: REQUIRED NESTED ===")
             file_errors+=("$required_errors")
+            parse_errors_to_json "schema" "REQUIRED_NESTED" "ERROR" "$required_errors" "false" ""
         fi
     fi
 
     # E8-E19: Best practices checks
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка HA (replicas >= 3)...${NC}"
     fi
     local ha_warnings
@@ -6597,9 +6817,10 @@ validate_yaml_file() {
     if [[ -n "$ha_warnings" ]]; then
         file_errors+=("=== BEST PRACTICE: HIGH AVAILABILITY ===")
         file_errors+=("$ha_warnings")
+        parse_errors_to_json "best_practice" "HIGH_AVAILABILITY" "INFO" "$ha_warnings" "false" ""
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка anti-affinity...${NC}"
     fi
     local affinity_warnings
@@ -6607,9 +6828,10 @@ validate_yaml_file() {
     if [[ -n "$affinity_warnings" ]]; then
         file_errors+=("=== BEST PRACTICE: ANTI-AFFINITY ===")
         file_errors+=("$affinity_warnings")
+        parse_errors_to_json "best_practice" "ANTI_AFFINITY" "INFO" "$affinity_warnings" "false" ""
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка rolling update strategy...${NC}"
     fi
     local strategy_warnings
@@ -6617,9 +6839,10 @@ validate_yaml_file() {
     if [[ -n "$strategy_warnings" ]]; then
         file_errors+=("=== BEST PRACTICE: UPDATE STRATEGY ===")
         file_errors+=("$strategy_warnings")
+        parse_errors_to_json "best_practice" "UPDATE_STRATEGY" "INFO" "$strategy_warnings" "false" ""
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка дублирующихся env переменных...${NC}"
     fi
     local dup_env_warnings
@@ -6627,9 +6850,10 @@ validate_yaml_file() {
     if [[ -n "$dup_env_warnings" ]]; then
         file_errors+=("=== BEST PRACTICE: DUPLICATE ENV ===")
         file_errors+=("$dup_env_warnings")
+        parse_errors_to_json "best_practice" "DUPLICATE_ENV" "WARNING" "$dup_env_warnings" "false" ""
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка namespace...${NC}"
     fi
     local ns_warnings
@@ -6637,9 +6861,10 @@ validate_yaml_file() {
     if [[ -n "$ns_warnings" ]]; then
         file_errors+=("=== BEST PRACTICE: NAMESPACE ===")
         file_errors+=("$ns_warnings")
+        parse_errors_to_json "best_practice" "MISSING_NAMESPACE" "INFO" "$ns_warnings" "false" ""
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка priorityClassName...${NC}"
     fi
     local priority_warnings
@@ -6647,9 +6872,10 @@ validate_yaml_file() {
     if [[ -n "$priority_warnings" ]]; then
         file_errors+=("=== BEST PRACTICE: PRIORITY CLASS ===")
         file_errors+=("$priority_warnings")
+        parse_errors_to_json "best_practice" "PRIORITY_CLASS" "INFO" "$priority_warnings" "false" ""
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка портов в probes...${NC}"
     fi
     local probe_port_warnings
@@ -6657,9 +6883,10 @@ validate_yaml_file() {
     if [[ -n "$probe_port_warnings" ]]; then
         file_errors+=("=== BEST PRACTICE: PROBE PORTS ===")
         file_errors+=("$probe_port_warnings")
+        parse_errors_to_json "best_practice" "PROBE_PORTS" "INFO" "$probe_port_warnings" "false" ""
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка ownership labels...${NC}"
     fi
     local owner_warnings
@@ -6667,9 +6894,10 @@ validate_yaml_file() {
     if [[ -n "$owner_warnings" ]]; then
         file_errors+=("=== BEST PRACTICE: OWNERSHIP LABELS ===")
         file_errors+=("$owner_warnings")
+        parse_errors_to_json "best_practice" "OWNERSHIP_LABELS" "INFO" "$owner_warnings" "false" ""
     fi
 
-    if [[ $verbose -eq 1 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
         echo -e "  ${CYAN}└─ Проверка dangling resources...${NC}"
     fi
     local dangling_warnings
@@ -6677,6 +6905,7 @@ validate_yaml_file() {
     if [[ -n "$dangling_warnings" ]]; then
         file_errors+=("=== BEST PRACTICE: DANGLING RESOURCES ===")
         file_errors+=("$dangling_warnings")
+        parse_errors_to_json "best_practice" "DANGLING_RESOURCES" "INFO" "$dangling_warnings" "false" ""
     fi
 
     # Add severity counts to totals
@@ -6690,16 +6919,16 @@ validate_yaml_file() {
     [[ ${SEVERITY_COUNTS[SECURITY]} -gt 0 ]] && severity_summary+=" S:${SEVERITY_COUNTS[SECURITY]}"
 
     if [[ ${#file_errors[@]} -eq 0 ]]; then
-        echo -e "${GREEN}[✓ УСПЕХ]${NC} $file - ошибок не найдено"
+        [[ $JSON_OUTPUT -eq 0 ]] && echo -e "${GREEN}[✓ УСПЕХ]${NC} $file - ошибок не найдено"
         ((PASSED_FILES++))
         return 0
     else
         # Check if this should be a failure based on severity mode
         if file_has_errors; then
-            echo -e "${RED}[✗ ОШИБКА]${NC} $file - обнаружены проблемы [${severity_summary# }]"
+            [[ $JSON_OUTPUT -eq 0 ]] && echo -e "${RED}[✗ ОШИБКА]${NC} $file - обнаружены проблемы [${severity_summary# }]"
             ((FAILED_FILES++))
         else
-            echo -e "${YELLOW}[⚠ ПРЕДУПРЕЖДЕНИЯ]${NC} $file - найдены замечания [${severity_summary# }]"
+            [[ $JSON_OUTPUT -eq 0 ]] && echo -e "${YELLOW}[⚠ ПРЕДУПРЕЖДЕНИЯ]${NC} $file - найдены замечания [${severity_summary# }]"
             ((PASSED_FILES++))
         fi
         ERRORS_FOUND+=("" "═══════════════════════════════════════════════════════════════════════")
@@ -6782,6 +7011,7 @@ main() {
     local recursive=0
     local verbose=0
     local output_file="yaml_validation_report.txt"
+    local output_file_explicit=0
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -6796,10 +7026,11 @@ main() {
                 esac
                 shift 2
                 ;;
-            -o|--output) output_file="$2"; shift 2 ;;
+            -o|--output) output_file="$2"; output_file_explicit=1; shift 2 ;;
             --key-ordering) CHECK_KEY_ORDERING=1; shift ;;
             --partial-schema) CHECK_PARTIAL_SCHEMA=1; shift ;;
             --all-checks) CHECK_KEY_ORDERING=1; CHECK_PARTIAL_SCHEMA=1; shift ;;
+            --json) JSON_OUTPUT=1; shift ;;
             -*) echo "Неизвестная опция: $1"; usage ;;
             *) target_dir="$1"; shift ;;
         esac
@@ -6817,51 +7048,71 @@ main() {
 
     TARGET_DIR="$target_dir"
 
-    print_header
-    echo -e "${BOLD}Начинаю валидацию YAML файлов...${NC}"
+    # In JSON mode, suppress console output
+    if [[ $JSON_OUTPUT -eq 0 ]]; then
+        print_header
+        echo -e "${BOLD}Начинаю валидацию YAML файлов...${NC}"
+    fi
 
     # Handle both files and directories
     if [[ -f "$target_dir" ]]; then
-        echo -e "Файл: ${CYAN}$target_dir${NC}"
+        [[ $JSON_OUTPUT -eq 0 ]] && echo -e "Файл: ${CYAN}$target_dir${NC}"
         yaml_files=("$target_dir")
     else
-        echo -e "Директория: ${CYAN}$target_dir${NC}"
-        echo -e "Режим: ${CYAN}$([ $recursive -eq 1 ] && echo "Рекурсивный" || echo "Только текущая директория")${NC}"
-        echo -e "Безопасность: ${CYAN}$SECURITY_MODE${NC}$([ $STRICT_MODE -eq 1 ] && echo " + ${YELLOW}STRICT${NC}")"
-        echo ""
-        echo -e "${YELLOW}[ПОИСК]${NC} Сканирование файлов..."
+        if [[ $JSON_OUTPUT -eq 0 ]]; then
+            echo -e "Директория: ${CYAN}$target_dir${NC}"
+            echo -e "Режим: ${CYAN}$([ $recursive -eq 1 ] && echo "Рекурсивный" || echo "Только текущая директория")${NC}"
+            echo -e "Безопасность: ${CYAN}$SECURITY_MODE${NC}$([ $STRICT_MODE -eq 1 ] && echo " + ${YELLOW}STRICT${NC}")"
+            echo ""
+            echo -e "${YELLOW}[ПОИСК]${NC} Сканирование файлов..."
+        fi
         mapfile -t yaml_files < <(find_yaml_files "$target_dir" "$recursive")
     fi
     TOTAL_FILES=${#yaml_files[@]}
 
     if [[ $TOTAL_FILES -eq 0 ]]; then
-        echo -e "${YELLOW}Предупреждение: YAML файлы не найдены${NC}"
+        if [[ $JSON_OUTPUT -eq 1 ]]; then
+            echo '{"version":"2.8.0","error":"No YAML files found","files":[]}'
+        else
+            echo -e "${YELLOW}Предупреждение: YAML файлы не найдены${NC}"
+        fi
         exit 0
     fi
 
-    echo -e "${GREEN}Найдено файлов: $TOTAL_FILES${NC}"
-    echo ""
+    [[ $JSON_OUTPUT -eq 0 ]] && echo -e "${GREEN}Найдено файлов: $TOTAL_FILES${NC}"
+    [[ $JSON_OUTPUT -eq 0 ]] && echo ""
 
     for file in "${yaml_files[@]}"; do
+        [[ $JSON_OUTPUT -eq 1 ]] && json_start_file "$file"
         validate_yaml_file "$file" "$verbose"
+        [[ $JSON_OUTPUT -eq 1 ]] && json_end_file
     done
 
-    echo ""
-    echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${BOLD}ИТОГИ ВАЛИДАЦИИ${NC}"
-    echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "Всего проверено:  ${BOLD}$TOTAL_FILES${NC} файлов"
-    echo -e "Успешно:          ${GREEN}$PASSED_FILES${NC} файлов"
-    echo -e "С ошибками:       ${RED}$FAILED_FILES${NC} файлов"
-    echo ""
+    # Output results
+    if [[ $JSON_OUTPUT -eq 1 ]]; then
+        if [[ $output_file_explicit -eq 1 ]]; then
+            output_json_report "$output_file"
+        else
+            output_json_report ""
+        fi
+    else
+        echo ""
+        echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        echo -e "${BOLD}ИТОГИ ВАЛИДАЦИИ${NC}"
+        echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        echo -e "Всего проверено:  ${BOLD}$TOTAL_FILES${NC} файлов"
+        echo -e "Успешно:          ${GREEN}$PASSED_FILES${NC} файлов"
+        echo -e "С ошибками:       ${RED}$FAILED_FILES${NC} файлов"
+        echo ""
 
-    generate_report "$output_file"
+        generate_report "$output_file"
+    fi
 
     if [[ $FAILED_FILES -gt 0 ]]; then
-        echo -e "${RED}Валидация завершена с ошибками${NC}"
+        [[ $JSON_OUTPUT -eq 0 ]] && echo -e "${RED}Валидация завершена с ошибками${NC}"
         exit 1
     else
-        echo -e "${GREEN}Валидация успешно завершена${NC}"
+        [[ $JSON_OUTPUT -eq 0 ]] && echo -e "${GREEN}Валидация успешно завершена${NC}"
         exit 0
     fi
 }

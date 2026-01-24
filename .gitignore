@@ -19,3 +19,6 @@ Thumbs.db
 
 # Claude settings (exclude entire directory)
 .claude/
+# JSON validation reports
+*.json
+!package*.json
