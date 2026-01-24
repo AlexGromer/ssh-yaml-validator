@@ -3156,7 +3156,7 @@ check_pss_baseline() {
             # seLinuxOptions allowed but type should be valid
             :
         fi
-        if [[ "$line" =~ type:[[:space:]]+([^[:space:]#]+) ]] && [[ -n "$(echo "$line" | grep -i selinux)" ]]; then
+        if [[ "$line" =~ type:[[:space:]]+([^[:space:]#]+) ]] && echo "$line" | grep -qi selinux; then
             local se_type="${BASH_REMATCH[1]}"
             se_type="${se_type//\"/}"
             se_type="${se_type//\'/}"
@@ -4991,7 +4991,6 @@ check_comment_indentation() {
     local warnings=()
     local prev_indent=0
     local prev_is_comment=0
-    local prev_line=""
 
     while IFS= read -r line || [[ -n "$line" ]]; do
         ((line_num++))
@@ -5011,7 +5010,6 @@ check_comment_indentation() {
             if [[ "$line" =~ ^#.*--- ]] || [[ "$line" =~ ^#.*\.\.\. ]]; then
                 prev_indent=$current_indent
                 prev_is_comment=1
-                prev_line="$line"
                 continue
             fi
 
@@ -5233,7 +5231,6 @@ check_key_ordering() {
     local prev_order=0
     local prev_key=""
     local line_num=0
-    local in_document=0
 
     while IFS= read -r line || [[ -n "$line" ]]; do
         ((line_num++))
