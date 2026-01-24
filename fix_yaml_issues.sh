@@ -25,7 +25,6 @@ fi
 FIXED_FILES=0
 TOTAL_FILES=0
 INTERACTIVE=0
-VERBOSE=0
 
 # Track fix statistics
 declare -A FIX_COUNTS=(
@@ -693,7 +692,7 @@ main() {
             -b|--backup) backup=1; shift ;;
             -n|--dry-run) dry_run=1; shift ;;
             -i|--interactive) INTERACTIVE=1; shift ;;
-            -v|--verbose) VERBOSE=1; shift ;;
+            -v|--verbose) shift ;;  # Reserved for future use
             -*) echo "Неизвестная опция: $1"; usage ;;
             *) target_dir="$1"; shift ;;
         esac

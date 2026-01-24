@@ -5036,7 +5036,6 @@ check_comment_indentation() {
         fi
 
         prev_indent=$current_indent
-        prev_line="$line"
     done < "$file"
 
     if [[ ${#warnings[@]} -gt 0 ]]; then
@@ -5243,7 +5242,6 @@ check_key_ordering() {
         if [[ "$line" =~ ^--- ]]; then
             prev_order=0
             prev_key=""
-            in_document=1
             continue
         fi
 
