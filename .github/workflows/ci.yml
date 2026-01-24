@@ -4,9 +4,7 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
     branches: [ main ]
-    paths:
-      - '**.sh'
-      - '.github/**'
+    # No path filter for PRs - all PRs need status checks for branch protection
   push:
     branches: [ main ]
     paths:
