@@ -1,0 +1,117 @@
+---
+# Test PSS Baseline and Restricted security checks
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: insecure-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: insecure
+  template:
+    metadata:
+      labels:
+        app: insecure
+      annotations:
+        # PSS Baseline: unconfined AppArmor
+        container.apparmor.security.beta.kubernetes.io/main: unconfined
+    spec:
+      # PSS Baseline violations
+      hostNetwork: true
+      hostPID: true
+      hostIPC: true
+
+      # Default service account (bad practice)
+      serviceAccountName: default
+
+      containers:
+        - name: main
+          image: nginx:latest
+          ports:
+            # SSH port - suspicious
+            - containerPort: 22
+            # Docker API port - dangerous
+            - containerPort: 2375
+            # hostPort - PSS Baseline violation
+            - containerPort: 80
+              hostPort: 80
+          securityContext:
+            # PSS Restricted violations
+            runAsUser: 0
+            runAsGroup: 0
+            allowPrivilegeEscalation: true
+            privileged: true
+            # Dangerous procMount
+            procMount: Unmasked
+            capabilities:
+              add:
+                # Dangerous capabilities
+                - SYS_ADMIN
+                - NET_ADMIN
+                - ALL
+          env:
+            # Secrets in env vars (bad practice)
+            - name: DATABASE_PASSWORD
+              value: "supersecret123"
+            - name: API_TOKEN
+              value: "token12345"
+
+      volumes:
+        # Sensitive mounts
+        - name: docker-sock
+          hostPath:
+            path: /var/run/docker.sock
+        - name: etc-mount
+          hostPath:
+            path: /etc
+        - name: root-mount
+          hostPath:
+            path: /
+---
+# Test RBAC security
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: dangerous-role
+rules:
+  # Wildcard in resources and verbs - like cluster-admin
+  - apiGroups: ["*"]
+    resources: ["*"]
+    verbs: ["*"]
+  # Access to secrets
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: dangerous-binding
+subjects:
+  - kind: ServiceAccount
+    name: default
+    namespace: default
+roleRef:
+  kind: ClusterRole
+  name: cluster-admin
+  apiGroup: rbac.authorization.k8s.io
+---
+# PSS Restricted: forbidden volume types
+apiVersion: v1
+kind: Pod
+metadata:
+  name: restricted-violation
+spec:
+  containers:
+    - name: app
+      image: nginx:1.21
+  volumes:
+    # hostPath forbidden in PSS Restricted
+    - name: data
+      hostPath:
+        path: /data
+    # gitRepo deprecated and forbidden
+    - name: git
+      gitRepo:
+        repository: https://github.com/example/repo

@@ -1,0 +1,33 @@
+---
+# Test yamllint-compatible checks
+#This comment has no space after hash
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: test-config
+  labels:
+    #bad-comment
+    app: test
+data:
+  # Good comment
+  key1: value1
+  key2: this is a very very very very very very very very very very very very very very very very very very very very long value that exceeds 120 characters limit
+  key3:value_without_space
+  key4 : value_with_space_before_colon
+  array_no_comma_space: [one,two,three,four]
+  array_extra_space: [  one,  two  ]
+  truthy_yes: yes
+  truthy_no: No
+  truthy_on: ON
+  truthy_y: y
+
+
+
+  # Too many empty lines above (more than 2)
+  key5: value5
+
+
+
+
+  # Another block of empty lines
+  key6: value6

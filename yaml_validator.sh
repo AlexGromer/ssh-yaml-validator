@@ -5,8 +5,8 @@
 # Pure bash implementation for Astra Linux SE 1.7 (Smolensk)
 # Purpose: Validate YAML files in Kubernetes clusters without external tools
 # Author: Generated for isolated environments
-# Version: 2.5.0
-# Updated: 2026-01-23
+# Version: 2.8.0
+# Updated: 2026-01-24
 #############################################################################
 
 set -o pipefail
@@ -30,10 +30,135 @@ PASSED_FILES=0
 FAILED_FILES=0
 ERRORS_FOUND=()
 
+# Severity levels (exit code influence)
+# ERROR: Blocks deployment, always fails validation (exit 1)
+# WARNING: Should be fixed, fails in strict mode
+# INFO: Style/informational, never fails
+# SECURITY: Security issue, configurable severity
+
+# Severity counters (per-file, reset for each file)
+declare -A SEVERITY_COUNTS
+SEVERITY_COUNTS[ERROR]=0
+SEVERITY_COUNTS[WARNING]=0
+SEVERITY_COUNTS[INFO]=0
+SEVERITY_COUNTS[SECURITY]=0
+
+# Total severity counters (cumulative)
+declare -A TOTAL_SEVERITY_COUNTS
+TOTAL_SEVERITY_COUNTS[ERROR]=0
+TOTAL_SEVERITY_COUNTS[WARNING]=0
+TOTAL_SEVERITY_COUNTS[INFO]=0
+TOTAL_SEVERITY_COUNTS[SECURITY]=0
+
+# Security mode: strict | normal | permissive
+# strict: SECURITY → ERROR (production)
+# normal: SECURITY → WARNING (default)
+# permissive: SECURITY → INFO (test/dev)
+SECURITY_MODE="normal"
+
+# Strict mode: treat all warnings as errors
+STRICT_MODE=0
+
+# Optional checks (disabled by default)
+CHECK_KEY_ORDERING=0      # A18: K8s key ordering convention
+CHECK_PARTIAL_SCHEMA=0    # C31-33: Partial type/enum validation
+
+# Reset severity counters for a new file
+reset_severity_counts() {
+    SEVERITY_COUNTS[ERROR]=0
+    SEVERITY_COUNTS[WARNING]=0
+    SEVERITY_COUNTS[INFO]=0
+    SEVERITY_COUNTS[SECURITY]=0
+}
+
+# Add to total severity counters
+add_to_totals() {
+    ((TOTAL_SEVERITY_COUNTS[ERROR] += SEVERITY_COUNTS[ERROR]))
+    ((TOTAL_SEVERITY_COUNTS[WARNING] += SEVERITY_COUNTS[WARNING]))
+    ((TOTAL_SEVERITY_COUNTS[INFO] += SEVERITY_COUNTS[INFO]))
+    ((TOTAL_SEVERITY_COUNTS[SECURITY] += SEVERITY_COUNTS[SECURITY]))
+}
+
+# Get effective severity based on SECURITY_MODE and STRICT_MODE
+# Usage: get_effective_severity "SECURITY" → returns "ERROR" or "WARNING" or "INFO"
+get_effective_severity() {
+    local severity="$1"
+
+    # Handle SECURITY level based on security mode
+    if [[ "$severity" == "SECURITY" ]]; then
+        case "$SECURITY_MODE" in
+            strict) severity="ERROR" ;;
+            normal) severity="WARNING" ;;
+            permissive) severity="INFO" ;;
+        esac
+    fi
+
+    # In strict mode, WARNING becomes ERROR
+    if [[ $STRICT_MODE -eq 1 && "$severity" == "WARNING" ]]; then
+        severity="ERROR"
+    fi
+
+    echo "$severity"
+}
+
+# Format message with severity prefix
+# Usage: format_msg "ERROR" "Строка 5" "Description"
+format_msg() {
+    local severity="$1"
+    local location="$2"
+    local message="$3"
+
+    local effective_severity
+    effective_severity=$(get_effective_severity "$severity")
+
+    # Increment counter
+    ((SEVERITY_COUNTS[$severity]++))
+
+    # Color and prefix based on effective severity
+    local prefix color
+    case "$effective_severity" in
+        ERROR)   prefix="❌ [ERROR]"; color="$RED" ;;
+        WARNING) prefix="⚠️  [WARN]"; color="$YELLOW" ;;
+        INFO)    prefix="ℹ️  [INFO]"; color="$BLUE" ;;
+        *)       prefix="[$severity]"; color="$NC" ;;
+    esac
+
+    # For security issues, add special marker
+    if [[ "$severity" == "SECURITY" ]]; then
+        prefix="🔒 [SECURITY:$SECURITY_MODE]"
+        case "$SECURITY_MODE" in
+            strict) color="$RED" ;;
+            normal) color="$YELLOW" ;;
+            permissive) color="$BLUE" ;;
+        esac
+    fi
+
+    echo -e "${color}${prefix}${NC} ${location}: ${message}"
+}
+
+# Check if file has blocking errors (should fail validation)
+file_has_errors() {
+    # Always fail on ERROR
+    [[ ${SEVERITY_COUNTS[ERROR]} -gt 0 ]] && return 0
+
+    # In strict mode, WARNING and SECURITY also fail
+    if [[ $STRICT_MODE -eq 1 ]]; then
+        [[ ${SEVERITY_COUNTS[WARNING]} -gt 0 ]] && return 0
+        [[ ${SEVERITY_COUNTS[SECURITY]} -gt 0 ]] && return 0
+    fi
+
+    # In strict security mode, SECURITY fails
+    if [[ "$SECURITY_MODE" == "strict" && ${SEVERITY_COUNTS[SECURITY]} -gt 0 ]]; then
+        return 0
+    fi
+
+    return 1
+}
+
 print_header() {
     echo -e "${BOLD}${CYAN}"
     echo "╔═══════════════════════════════════════════════════════════════════════╗"
-    echo "║                    YAML Validator v2.5.0                              ║"
+    echo "║                    YAML Validator v2.8.0                              ║"
     echo "║              Pure Bash Implementation for Air-Gapped Env              ║"
     echo "╚═══════════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
@@ -47,13 +172,29 @@ usage() {
     -o, --output FILE       Сохранить отчёт в файл (по умолчанию: yaml_validation_report.txt)
     -r, --recursive         Рекурсивный поиск YAML файлов (только для директорий)
     -v, --verbose           Подробный вывод
+    -s, --strict            Строгий режим: WARNING и SECURITY → ERROR
+    --security-mode MODE    Режим безопасности: strict | normal | permissive
+                            strict    - SECURITY → ERROR (production)
+                            normal    - SECURITY → WARNING (default)
+                            permissive - SECURITY → INFO (test/dev)
+    --key-ordering          Включить проверку порядка ключей K8s (A18)
+    --partial-schema        Включить частичную проверку типов (C31-C33)
+    --all-checks            Включить все опциональные проверки
     -h, --help              Показать эту справку
+
+Уровни серьёзности:
+    ERROR     Блокирует деплой, всегда ошибка валидации
+    WARNING   Следует исправить, ошибка в strict режиме
+    INFO      Стиль/информация, никогда не ошибка
+    SECURITY  Проблема безопасности, зависит от --security-mode
 
 Примеры:
     $0 /path/to/manifests
     $0 config.yaml
     $0 -r -o report.txt /path/to/manifests
-    $0 --recursive --verbose /home/user/k8s/
+    $0 --strict /home/user/k8s/                      # Строгий режим
+    $0 --security-mode permissive test-manifests/    # Тестовый кластер
+    $0 --security-mode strict production-manifests/  # Продакшн
 
 EOF
     exit 0
@@ -2898,6 +3039,826 @@ check_security_best_practices() {
     return 0
 }
 
+# === PSS BASELINE SECURITY CHECKS (v2.6.0) ===
+
+check_pss_baseline() {
+    local file="$1"
+    local line_num=0
+    local warnings=()
+    local in_capabilities=0
+    local capabilities_indent=0
+    local in_add_caps=0
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Skip comments
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+
+        # Check hostPort (PSS Baseline: should be restricted)
+        if [[ "$line" =~ hostPort:[[:space:]]+([0-9]+) ]]; then
+            local port="${BASH_REMATCH[1]}"
+            warnings+=("Строка $line_num: PSS BASELINE: hostPort: $port — привязка к порту хоста")
+            warnings+=("  Риск: Обход сетевых политик, потенциальный конфликт портов")
+            warnings+=("  Рекомендация: Используйте Service NodePort/LoadBalancer")
+        fi
+
+        # Check procMount (PSS Baseline: must be Default or Unmasked)
+        if [[ "$line" =~ procMount:[[:space:]]+([^[:space:]#]+) ]]; then
+            local procmount="${BASH_REMATCH[1]}"
+            procmount="${procmount//\"/}"
+            procmount="${procmount//\'/}"
+            if [[ "$procmount" != "Default" ]] && [[ "$procmount" != "Unmasked" ]]; then
+                warnings+=("Строка $line_num: PSS BASELINE: procMount: $procmount")
+                warnings+=("  Допустимо: Default, Unmasked")
+            fi
+        fi
+
+        # Track capabilities section
+        if [[ "$line" =~ ^([[:space:]]*)capabilities:[[:space:]]*$ ]]; then
+            in_capabilities=1
+            capabilities_indent=${#BASH_REMATCH[1]}
+            continue
+        fi
+
+        # Check add capabilities
+        if [[ $in_capabilities -eq 1 ]] && [[ "$line" =~ ^([[:space:]]*)add:[[:space:]]*$ ]]; then
+            in_add_caps=1
+            continue
+        fi
+
+        if [[ $in_add_caps -eq 1 ]]; then
+            # Check for dangerous capabilities (PSS Baseline forbidden)
+            local dangerous_caps="SYS_ADMIN|NET_ADMIN|SYS_PTRACE|SYS_RAWIO|SYS_MODULE|SYS_BOOT|SYS_TIME|SYS_CHROOT|MKNOD|SETUID|SETGID|CHOWN|DAC_OVERRIDE|FOWNER|FSETID|LINUX_IMMUTABLE|MAC_ADMIN|MAC_OVERRIDE|SYS_PACCT|SYS_NICE|SYS_RESOURCE|SYS_TTY_CONFIG|AUDIT_CONTROL|AUDIT_WRITE|BLOCK_SUSPEND|LEASE|NET_BIND_SERVICE|NET_BROADCAST|IPC_LOCK|IPC_OWNER|SETFCAP|SETPCAP|WAKE_ALARM"
+
+            if [[ "$line" =~ ^[[:space:]]*-[[:space:]]*([A-Z_]+) ]]; then
+                local cap="${BASH_REMATCH[1]}"
+                if [[ "$cap" =~ ^($dangerous_caps)$ ]]; then
+                    warnings+=("Строка $line_num: PSS BASELINE: Опасная capability: $cap")
+                    warnings+=("  Риск: Расширение привилегий контейнера")
+                fi
+
+                # ALL is especially dangerous
+                if [[ "$cap" == "ALL" ]]; then
+                    warnings+=("Строка $line_num: PSS BASELINE: capabilities.add: ALL — КРИТИЧНО!")
+                    warnings+=("  Риск: Контейнер получает ВСЕ capabilities")
+                    warnings+=("  Рекомендация: Укажите только необходимые capabilities")
+                fi
+            fi
+        fi
+
+        # Check drop capabilities (good practice to drop NET_RAW)
+        if [[ $in_capabilities -eq 1 ]] && [[ "$line" =~ ^([[:space:]]*)drop:[[:space:]]*$ ]]; then
+            in_add_caps=0
+        fi
+
+        # Exit capabilities section on dedent
+        if [[ $in_capabilities -eq 1 ]] && [[ "$line" =~ ^([[:space:]]*)[a-zA-Z] ]]; then
+            local current_indent=${#BASH_REMATCH[1]}
+            if [[ $current_indent -le $capabilities_indent ]] && [[ ! "$line" =~ capabilities ]]; then
+                in_capabilities=0
+                in_add_caps=0
+            fi
+        fi
+
+        # Check sysctls (PSS Baseline: only safe sysctls allowed)
+        if [[ "$line" =~ sysctls:[[:space:]]*$ ]]; then
+            # Track that sysctls are used - will check individual values
+            :
+        fi
+
+        # Check for unsafe sysctls
+        if [[ "$line" =~ name:[[:space:]]+([^[:space:]#]+) ]] && [[ "$line" =~ sysctl ]]; then
+            local sysctl_name="${BASH_REMATCH[1]}"
+            sysctl_name="${sysctl_name//\"/}"
+            sysctl_name="${sysctl_name//\'/}"
+
+            # Safe sysctls per PSS Baseline
+            local safe_sysctls="kernel.shm_rmid_forced|net.ipv4.ip_local_port_range|net.ipv4.ip_unprivileged_port_start|net.ipv4.tcp_syncookies|net.ipv4.ping_group_range"
+
+            if [[ ! "$sysctl_name" =~ ^($safe_sysctls)$ ]]; then
+                warnings+=("Строка $line_num: PSS BASELINE: Небезопасный sysctl: $sysctl_name")
+                warnings+=("  Допустимые: kernel.shm_rmid_forced, net.ipv4.ip_local_port_range, net.ipv4.tcp_syncookies")
+            fi
+        fi
+
+        # Check AppArmor annotation (PSS Baseline)
+        if [[ "$line" =~ container.apparmor.security.beta.kubernetes.io ]]; then
+            if [[ "$line" =~ unconfined ]]; then
+                warnings+=("Строка $line_num: PSS BASELINE: AppArmor profile: unconfined")
+                warnings+=("  Риск: Контейнер без AppArmor защиты")
+                warnings+=("  Рекомендация: Используйте runtime/default или custom profile")
+            fi
+        fi
+
+        # Check SELinux options (PSS Baseline)
+        if [[ "$line" =~ seLinuxOptions:[[:space:]]*$ ]]; then
+            # seLinuxOptions allowed but type should be valid
+            :
+        fi
+        if [[ "$line" =~ type:[[:space:]]+([^[:space:]#]+) ]] && echo "$line" | grep -qi selinux; then
+            local se_type="${BASH_REMATCH[1]}"
+            se_type="${se_type//\"/}"
+            se_type="${se_type//\'/}"
+
+            # Check for potentially unsafe SELinux types
+            if [[ "$se_type" == "unconfined_t" ]] || [[ "$se_type" == "spc_t" ]]; then
+                warnings+=("Строка $line_num: PSS BASELINE: SELinux type: $se_type")
+                warnings+=("  Риск: Небезопасный SELinux контекст")
+            fi
+        fi
+
+    done < "$file"
+
+    if [[ ${#warnings[@]} -gt 0 ]]; then
+        printf '%s\n' "${warnings[@]}"
+    fi
+    return 0
+}
+
+check_pss_restricted() {
+    local file="$1"
+    local line_num=0
+    local warnings=()
+    local in_volumes=0
+    local volumes_indent=0
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Skip comments
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+
+        # Check runAsUser: 0 (PSS Restricted: must be non-zero)
+        if [[ "$line" =~ runAsUser:[[:space:]]+([0-9]+) ]]; then
+            local uid="${BASH_REMATCH[1]}"
+            if [[ $uid -eq 0 ]]; then
+                warnings+=("Строка $line_num: PSS RESTRICTED: runAsUser: 0 (root)")
+                warnings+=("  Требование: Используйте непривилегированного пользователя (UID >= 1000)")
+            fi
+        fi
+
+        # Check runAsGroup: 0 (PSS Restricted: should be non-zero)
+        if [[ "$line" =~ runAsGroup:[[:space:]]+([0-9]+) ]]; then
+            local gid="${BASH_REMATCH[1]}"
+            if [[ $gid -eq 0 ]]; then
+                warnings+=("Строка $line_num: PSS RESTRICTED: runAsGroup: 0 (root group)")
+                warnings+=("  Рекомендация: Используйте непривилегированную группу (GID >= 1000)")
+            fi
+        fi
+
+        # Check fsGroup: 0 (PSS Restricted: should be non-zero)
+        if [[ "$line" =~ fsGroup:[[:space:]]+([0-9]+) ]]; then
+            local fsgroup="${BASH_REMATCH[1]}"
+            if [[ $fsgroup -eq 0 ]]; then
+                warnings+=("Строка $line_num: PSS RESTRICTED: fsGroup: 0 (root group)")
+            fi
+        fi
+
+        # Track volumes section
+        if [[ "$line" =~ ^([[:space:]]*)volumes:[[:space:]]*$ ]]; then
+            in_volumes=1
+            volumes_indent=${#BASH_REMATCH[1]}
+            continue
+        fi
+
+        # Check volume types (PSS Restricted: limited volume types)
+        if [[ $in_volumes -eq 1 ]]; then
+            # Allowed: configMap, csi, downwardAPI, emptyDir, ephemeral,
+            # persistentVolumeClaim, projected, secret
+
+            # Forbidden volume types
+            if [[ "$line" =~ ^[[:space:]]*(hostPath|gcePersistentDisk|awsElasticBlockStore|gitRepo|nfs|iscsi|glusterfs|rbd|cephfs|cinder|fc|flocker|flexVolume|azureFile|azureDisk|vsphereVolume|quobyte|photonPersistentDisk|portworxVolume|scaleIO|storageos):[[:space:]]* ]]; then
+                local vol_type="${BASH_REMATCH[1]}"
+                warnings+=("Строка $line_num: PSS RESTRICTED: Запрещённый тип volume: $vol_type")
+                warnings+=("  Допустимо: configMap, csi, downwardAPI, emptyDir, ephemeral, persistentVolumeClaim, projected, secret")
+            fi
+
+            # Exit volumes section on dedent
+            if [[ "$line" =~ ^([[:space:]]*)[a-zA-Z] ]]; then
+                local current_indent=${#BASH_REMATCH[1]}
+                if [[ $current_indent -le $volumes_indent ]] && [[ ! "$line" =~ volumes ]]; then
+                    in_volumes=0
+                fi
+            fi
+        fi
+
+        # Check seccompProfile (PSS Restricted: required)
+        # Note: In PSS Restricted, seccomp profile must be set to RuntimeDefault or Localhost
+        if [[ "$line" =~ seccompProfile:[[:space:]]*$ ]]; then
+            # Found seccompProfile, check type on next relevant line
+            :
+        fi
+
+        if [[ "$line" =~ type:[[:space:]]+Unconfined ]] && grep -q "seccompProfile" "$file" 2>/dev/null; then
+            # Only warn if this is in seccompProfile context
+            warnings+=("Строка $line_num: PSS RESTRICTED: seccompProfile type: Unconfined")
+            warnings+=("  Требование: Используйте RuntimeDefault или Localhost")
+        fi
+
+    done < "$file"
+
+    if [[ ${#warnings[@]} -gt 0 ]]; then
+        printf '%s\n' "${warnings[@]}"
+    fi
+    return 0
+}
+
+check_sensitive_mounts() {
+    local file="$1"
+    local line_num=0
+    local warnings=()
+    local in_hostpath=0
+    local hostpath_line=0
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Skip comments
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+
+        # Track hostPath volume
+        if [[ "$line" =~ hostPath:[[:space:]]*$ ]]; then
+            in_hostpath=1
+            hostpath_line=$line_num
+            continue
+        fi
+
+        if [[ $in_hostpath -eq 1 ]]; then
+            if [[ "$line" =~ path:[[:space:]]+([^[:space:]#]+) ]]; then
+                local mount_path="${BASH_REMATCH[1]}"
+                mount_path="${mount_path//\"/}"
+                mount_path="${mount_path//\'/}"
+
+                # Check docker.sock
+                if [[ "$mount_path" == "/var/run/docker.sock" ]] || \
+                   [[ "$mount_path" == "/run/docker.sock" ]] || \
+                   [[ "$mount_path" =~ docker\.sock$ ]]; then
+                    warnings+=("Строка $hostpath_line: КРИТИЧНО: Монтирование Docker socket: $mount_path")
+                    warnings+=("  Риск: Полный контроль над Docker daemon → container escape")
+                    warnings+=("  Рекомендация: Никогда не монтируйте docker.sock в контейнеры")
+                fi
+
+                # Check containerd socket
+                if [[ "$mount_path" == "/run/containerd/containerd.sock" ]] || \
+                   [[ "$mount_path" =~ containerd\.sock$ ]]; then
+                    warnings+=("Строка $hostpath_line: КРИТИЧНО: Монтирование containerd socket: $mount_path")
+                    warnings+=("  Риск: Полный контроль над container runtime")
+                fi
+
+                # Check CRI-O socket
+                if [[ "$mount_path" == "/var/run/crio/crio.sock" ]] || \
+                   [[ "$mount_path" =~ crio\.sock$ ]]; then
+                    warnings+=("Строка $hostpath_line: КРИТИЧНО: Монтирование CRI-O socket: $mount_path")
+                fi
+
+                # Check sensitive host paths
+                if [[ "$mount_path" == "/" ]]; then
+                    warnings+=("Строка $hostpath_line: КРИТИЧНО: Монтирование root filesystem: /")
+                    warnings+=("  Риск: Полный доступ к файловой системе хоста")
+                fi
+
+                if [[ "$mount_path" == "/etc" ]] || [[ "$mount_path" =~ ^/etc/ ]]; then
+                    warnings+=("Строка $hostpath_line: ОПАСНО: Монтирование /etc: $mount_path")
+                    warnings+=("  Риск: Доступ к конфигурации хоста, /etc/shadow, /etc/passwd")
+                fi
+
+                if [[ "$mount_path" == "/root" ]] || [[ "$mount_path" =~ ^/root/ ]]; then
+                    warnings+=("Строка $hostpath_line: ОПАСНО: Монтирование /root: $mount_path")
+                    warnings+=("  Риск: Доступ к домашней директории root")
+                fi
+
+                if [[ "$mount_path" == "/var/log" ]] || [[ "$mount_path" =~ ^/var/log/ ]]; then
+                    warnings+=("Строка $hostpath_line: ПРЕДУПРЕЖДЕНИЕ: Монтирование /var/log: $mount_path")
+                    warnings+=("  Риск: Доступ к логам хоста, возможная утечка данных")
+                fi
+
+                if [[ "$mount_path" == "/proc" ]] || [[ "$mount_path" =~ ^/proc/ ]]; then
+                    warnings+=("Строка $hostpath_line: КРИТИЧНО: Монтирование /proc: $mount_path")
+                    warnings+=("  Риск: Доступ к информации о процессах хоста")
+                fi
+
+                if [[ "$mount_path" == "/sys" ]] || [[ "$mount_path" =~ ^/sys/ ]]; then
+                    warnings+=("Строка $hostpath_line: ОПАСНО: Монтирование /sys: $mount_path")
+                    warnings+=("  Риск: Доступ к системной информации и параметрам ядра")
+                fi
+
+                if [[ "$mount_path" == "/dev" ]] || [[ "$mount_path" =~ ^/dev/ ]]; then
+                    warnings+=("Строка $hostpath_line: ОПАСНО: Монтирование /dev: $mount_path")
+                    warnings+=("  Риск: Доступ к устройствам хоста")
+                fi
+
+                # Check kubelet paths
+                if [[ "$mount_path" =~ ^/var/lib/kubelet ]]; then
+                    warnings+=("Строка $hostpath_line: ОПАСНО: Монтирование kubelet directory: $mount_path")
+                    warnings+=("  Риск: Доступ к данным kubelet, включая секреты")
+                fi
+
+                # Check etcd paths
+                if [[ "$mount_path" =~ ^/var/lib/etcd ]]; then
+                    warnings+=("Строка $hostpath_line: КРИТИЧНО: Монтирование etcd directory: $mount_path")
+                    warnings+=("  Риск: Доступ к данным etcd кластера")
+                fi
+
+                in_hostpath=0
+            fi
+        fi
+
+        # Check for mountPath pointing to sensitive locations
+        if [[ "$line" =~ mountPath:[[:space:]]+([^[:space:]#]+) ]]; then
+            local mount_path="${BASH_REMATCH[1]}"
+            mount_path="${mount_path//\"/}"
+            mount_path="${mount_path//\'/}"
+
+            # Check if mounting to sensitive container paths
+            if [[ "$mount_path" == "/etc/kubernetes" ]]; then
+                warnings+=("Строка $line_num: ПРЕДУПРЕЖДЕНИЕ: mountPath к /etc/kubernetes")
+                warnings+=("  Проверьте, что это необходимо")
+            fi
+        fi
+
+    done < "$file"
+
+    if [[ ${#warnings[@]} -gt 0 ]]; then
+        printf '%s\n' "${warnings[@]}"
+    fi
+    return 0
+}
+
+# D20: Check for writable hostPath mounts (readOnly not set or false)
+check_writable_hostpath() {
+    local file="$1"
+    local line_num=0
+    local warnings=()
+    local in_volumemount=0
+    local mount_name=""
+    local mount_line=0
+    local has_readonly=0
+    local readonly_false=0
+
+    # First pass: find volumeMounts with hostPath volumes that are not readOnly
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Skip comments
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+
+        # Track volumeMount blocks
+        if [[ "$line" =~ volumeMounts:[[:space:]]*$ ]]; then
+            in_volumemount=1
+            continue
+        fi
+
+        if [[ $in_volumemount -eq 1 ]]; then
+            # New mount item
+            if [[ "$line" =~ ^[[:space:]]*-[[:space:]]*name:[[:space:]]+([^[:space:]#]+) ]]; then
+                # Check previous mount
+                if [[ -n "$mount_name" && $has_readonly -eq 0 ]]; then
+                    warnings+=("[SECURITY] Строка $mount_line: volumeMount '$mount_name' без readOnly: true")
+                    warnings+=("  Рекомендация: Добавьте readOnly: true для безопасности")
+                elif [[ -n "$mount_name" && $readonly_false -eq 1 ]]; then
+                    warnings+=("[SECURITY] Строка $mount_line: volumeMount '$mount_name' имеет readOnly: false")
+                    warnings+=("  Риск: Запись в hostPath volume может повредить хост")
+                fi
+
+                mount_name="${BASH_REMATCH[1]}"
+                mount_line=$line_num
+                has_readonly=0
+                readonly_false=0
+                continue
+            fi
+
+            # Check for readOnly field
+            if [[ "$line" =~ readOnly:[[:space:]]+(true|True|TRUE) ]]; then
+                has_readonly=1
+            elif [[ "$line" =~ readOnly:[[:space:]]+(false|False|FALSE) ]]; then
+                has_readonly=1
+                readonly_false=1
+            fi
+
+            # Exit volumeMounts on unindent
+            if [[ "$line" =~ ^[[:space:]]{0,3}[^[:space:]] ]] && [[ ! "$line" =~ ^[[:space:]]*- ]]; then
+                # Check last mount
+                if [[ -n "$mount_name" && $has_readonly -eq 0 ]]; then
+                    warnings+=("[SECURITY] Строка $mount_line: volumeMount '$mount_name' без readOnly: true")
+                    warnings+=("  Рекомендация: Добавьте readOnly: true для безопасности")
+                elif [[ -n "$mount_name" && $readonly_false -eq 1 ]]; then
+                    warnings+=("[SECURITY] Строка $mount_line: volumeMount '$mount_name' имеет readOnly: false")
+                fi
+                in_volumemount=0
+                mount_name=""
+            fi
+        fi
+    done < "$file"
+
+    if [[ ${#warnings[@]} -gt 0 ]]; then
+        printf '%s\n' "${warnings[@]}"
+    fi
+    return 0
+}
+
+# D23: Check that NET_RAW capability is dropped
+check_drop_net_raw() {
+    local file="$1"
+    local line_num=0
+    local warnings=()
+    local in_capabilities=0
+    local in_drop=0
+    local has_drop_all=0
+    local has_drop_net_raw=0
+    local container_line=0
+    local container_name=""
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Skip comments
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+
+        # Track container start
+        if [[ "$line" =~ ^[[:space:]]*-[[:space:]]*name:[[:space:]]+([^[:space:]#]+) ]]; then
+            # Check previous container
+            if [[ -n "$container_name" && $has_drop_all -eq 0 && $has_drop_net_raw -eq 0 ]]; then
+                # Only warn if this is a container (not initContainer check for simplicity)
+                warnings+=("[SECURITY] Контейнер '$container_name': NET_RAW capability не удалена")
+                warnings+=("  Строка $container_line: Рекомендация: Добавьте capabilities.drop: [NET_RAW] или [ALL]")
+                warnings+=("  Риск: NET_RAW позволяет создавать raw sockets (сетевые атаки)")
+            fi
+            container_name="${BASH_REMATCH[1]}"
+            container_line=$line_num
+            has_drop_all=0
+            has_drop_net_raw=0
+            in_capabilities=0
+            in_drop=0
+            continue
+        fi
+
+        # Track capabilities block
+        if [[ "$line" =~ capabilities:[[:space:]]*$ ]]; then
+            in_capabilities=1
+            continue
+        fi
+
+        if [[ $in_capabilities -eq 1 ]]; then
+            # Track drop section
+            if [[ "$line" =~ drop:[[:space:]]*$ ]]; then
+                in_drop=1
+                continue
+            fi
+
+            # Check dropped capabilities
+            if [[ $in_drop -eq 1 ]]; then
+                if [[ "$line" =~ ^[[:space:]]*-[[:space:]]*(ALL|all) ]]; then
+                    has_drop_all=1
+                fi
+                if [[ "$line" =~ ^[[:space:]]*-[[:space:]]*(NET_RAW|net_raw) ]]; then
+                    has_drop_net_raw=1
+                fi
+                # Inline array format: drop: [ALL] or drop: [NET_RAW, ...]
+                if [[ "$line" =~ drop:[[:space:]]*\[.*ALL.*\] ]]; then
+                    has_drop_all=1
+                fi
+                if [[ "$line" =~ drop:[[:space:]]*\[.*NET_RAW.*\] ]]; then
+                    has_drop_net_raw=1
+                fi
+            fi
+
+            # Exit capabilities on unindent to add:
+            if [[ "$line" =~ add: ]]; then
+                in_drop=0
+            fi
+        fi
+
+        # Exit capabilities block on securityContext end
+        if [[ "$line" =~ ^[[:space:]]{4}[a-zA-Z] ]] && [[ $in_capabilities -eq 1 ]] && [[ ! "$line" =~ capabilities ]]; then
+            in_capabilities=0
+            in_drop=0
+        fi
+    done < "$file"
+
+    # Check last container
+    if [[ -n "$container_name" && $has_drop_all -eq 0 && $has_drop_net_raw -eq 0 ]]; then
+        warnings+=("[SECURITY] Контейнер '$container_name': NET_RAW capability не удалена")
+        warnings+=("  Строка $container_line: Рекомендация: Добавьте capabilities.drop: [NET_RAW] или [ALL]")
+    fi
+
+    if [[ ${#warnings[@]} -gt 0 ]]; then
+        printf '%s\n' "${warnings[@]}"
+    fi
+    return 0
+}
+
+check_privileged_ports() {
+    local file="$1"
+    local line_num=0
+    local warnings=()
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Skip comments
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+
+        # Check containerPort for privileged ports
+        if [[ "$line" =~ containerPort:[[:space:]]+([0-9]+) ]]; then
+            local port="${BASH_REMATCH[1]}"
+
+            # Check SSH port
+            if [[ $port -eq 22 ]]; then
+                warnings+=("Строка $line_num: БЕЗОПАСНОСТЬ: containerPort: 22 (SSH)")
+                warnings+=("  Вопрос: Зачем SSH в контейнере? Используйте kubectl exec")
+            fi
+
+            # Check privileged ports (< 1024)
+            if [[ $port -lt 1024 ]] && [[ $port -ne 80 ]] && [[ $port -ne 443 ]]; then
+                warnings+=("Строка $line_num: ИНФОРМАЦИЯ: Privileged port $port (< 1024)")
+                warnings+=("  Примечание: Требует NET_BIND_SERVICE capability или root")
+            fi
+
+            # Common dangerous ports
+            case $port in
+                23)
+                    warnings+=("Строка $line_num: БЕЗОПАСНОСТЬ: Port 23 (Telnet) — небезопасный протокол")
+                    ;;
+                2375|2376)
+                    warnings+=("Строка $line_num: КРИТИЧНО: Port $port (Docker API)")
+                    warnings+=("  Риск: Прямой доступ к Docker daemon")
+                    ;;
+                6443)
+                    warnings+=("Строка $line_num: ИНФОРМАЦИЯ: Port 6443 (Kubernetes API)")
+                    ;;
+                10250)
+                    warnings+=("Строка $line_num: ПРЕДУПРЕЖДЕНИЕ: Port 10250 (Kubelet API)")
+                    warnings+=("  Риск: При неправильной настройке — доступ к kubelet")
+                    ;;
+                2379|2380)
+                    warnings+=("Строка $line_num: ПРЕДУПРЕЖДЕНИЕ: Port $port (etcd)")
+                    warnings+=("  Риск: Прямой доступ к etcd")
+                    ;;
+            esac
+        fi
+
+        # Check hostPort
+        if [[ "$line" =~ hostPort:[[:space:]]+([0-9]+) ]]; then
+            local port="${BASH_REMATCH[1]}"
+            if [[ $port -lt 1024 ]]; then
+                warnings+=("Строка $line_num: БЕЗОПАСНОСТЬ: hostPort: $port (privileged < 1024)")
+            fi
+        fi
+
+    done < "$file"
+
+    if [[ ${#warnings[@]} -gt 0 ]]; then
+        printf '%s\n' "${warnings[@]}"
+    fi
+    return 0
+}
+
+check_rbac_security() {
+    local file="$1"
+    local line_num=0
+    local warnings=()
+    local detected_kind=""
+    local in_rules=0
+    local in_rule=0
+    local current_verbs=""
+    local current_resources=""
+    local rule_line=0
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Skip comments
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+
+        # Detect RBAC kinds
+        if [[ "$line" =~ ^kind:[[:space:]]+(ClusterRole|Role|ClusterRoleBinding|RoleBinding) ]]; then
+            detected_kind="${BASH_REMATCH[1]}"
+        fi
+
+        # Reset on document separator
+        if [[ "$line" =~ ^---[[:space:]]*$ ]]; then
+            detected_kind=""
+            in_rules=0
+            in_rule=0
+        fi
+
+        # Check for binding to cluster-admin
+        if [[ "$detected_kind" =~ RoleBinding ]] && [[ "$line" =~ name:[[:space:]]+cluster-admin ]]; then
+            warnings+=("Строка $line_num: КРИТИЧНО: Привязка к cluster-admin")
+            warnings+=("  Риск: Полные права администратора кластера")
+            warnings+=("  Рекомендация: Используйте минимально необходимые права")
+        fi
+
+        # Check for default service account usage
+        if [[ "$detected_kind" =~ RoleBinding ]]; then
+            if [[ "$line" =~ name:[[:space:]]+default[[:space:]]*$ ]] || \
+               [[ "$line" =~ name:[[:space:]]+\"default\" ]] || \
+               [[ "$line" =~ name:[[:space:]]+\'default\' ]]; then
+                warnings+=("Строка $line_num: ПРЕДУПРЕЖДЕНИЕ: Использование default ServiceAccount")
+                warnings+=("  Рекомендация: Создайте отдельный ServiceAccount для приложения")
+            fi
+        fi
+
+        # Track rules section
+        if [[ "$detected_kind" =~ ^(Cluster)?Role$ ]]; then
+            if [[ "$line" =~ ^([[:space:]]*)rules:[[:space:]]*$ ]]; then
+                in_rules=1
+                continue
+            fi
+
+            if [[ $in_rules -eq 1 ]]; then
+                # New rule starts with -
+                if [[ "$line" =~ ^[[:space:]]*-[[:space:]]* ]]; then
+                    # Check previous rule if we had one
+                    if [[ $in_rule -eq 1 ]] && [[ "$current_verbs" == *"*"* ]] && [[ "$current_resources" == *"*"* ]]; then
+                        warnings+=("Строка $rule_line: КРИТИЧНО: Wildcard в verbs И resources")
+                        warnings+=("  Правило: resources: *, verbs: * — эквивалент cluster-admin")
+                    fi
+
+                    in_rule=1
+                    rule_line=$line_num
+                    current_verbs=""
+                    current_resources=""
+                fi
+
+                # Capture verbs
+                if [[ "$line" =~ verbs:[[:space:]]*\[([^\]]*)\] ]]; then
+                    current_verbs="${BASH_REMATCH[1]}"
+                elif [[ "$line" =~ verbs:[[:space:]]*$ ]]; then
+                    # Multi-line verbs, will be captured below
+                    :
+                fi
+
+                # Capture resources
+                if [[ "$line" =~ resources:[[:space:]]*\[([^\]]*)\] ]]; then
+                    current_resources="${BASH_REMATCH[1]}"
+                fi
+
+                # Check for wildcards in arrays
+                if [[ "$line" =~ ^[[:space:]]*-[[:space:]]*[\"\']?\*[\"\']?[[:space:]]*$ ]]; then
+                    if [[ -n "$current_resources" ]] || [[ "$current_resources" == *"*"* ]]; then
+                        # This is likely in verbs array
+                        current_verbs="*"
+                    fi
+                fi
+
+                # Direct wildcard checks
+                if [[ "$line" =~ resources:[[:space:]]*\[.*\*.*\] ]]; then
+                    warnings+=("Строка $line_num: ПРЕДУПРЕЖДЕНИЕ: Wildcard в resources")
+                    warnings+=("  Рекомендация: Укажите конкретные ресурсы")
+                fi
+
+                if [[ "$line" =~ verbs:[[:space:]]*\[.*\*.*\] ]]; then
+                    warnings+=("Строка $line_num: ПРЕДУПРЕЖДЕНИЕ: Wildcard в verbs")
+                    warnings+=("  Рекомендация: Укажите конкретные действия (get, list, watch, etc.)")
+                fi
+
+                # Check for secrets access
+                if [[ "$line" =~ resources:.*secrets ]]; then
+                    warnings+=("Строка $line_num: ИНФОРМАЦИЯ: Доступ к secrets")
+                    warnings+=("  Убедитесь, что это необходимо")
+                fi
+            fi
+        fi
+
+    done < "$file"
+
+    # Check last rule
+    if [[ $in_rule -eq 1 ]] && [[ "$current_verbs" == *"*"* ]] && [[ "$current_resources" == *"*"* ]]; then
+        warnings+=("Строка $rule_line: КРИТИЧНО: Wildcard в verbs И resources")
+    fi
+
+    if [[ ${#warnings[@]} -gt 0 ]]; then
+        printf '%s\n' "${warnings[@]}"
+    fi
+    return 0
+}
+
+check_secrets_in_env() {
+    local file="$1"
+    local line_num=0
+    local warnings=()
+    local in_env=0
+    local env_indent=0
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Skip comments
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+
+        # Track env section
+        if [[ "$line" =~ ^([[:space:]]*)env:[[:space:]]*$ ]]; then
+            in_env=1
+            env_indent=${#BASH_REMATCH[1]}
+            continue
+        fi
+
+        if [[ $in_env -eq 1 ]]; then
+            # Check for value: with sensitive keywords
+            if [[ "$line" =~ value:[[:space:]]+([^[:space:]#]+) ]]; then
+                local env_value="${BASH_REMATCH[1]}"
+                env_value="${env_value//\"/}"
+                env_value="${env_value//\'/}"
+
+                # Check if previous line was a sensitive env name
+                # This is a simple check, could be enhanced
+                :
+            fi
+
+            # Check for hardcoded secrets patterns
+            if [[ "$line" =~ name:[[:space:]]+(.*[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd].*|.*[Ss][Ee][Cc][Rr][Ee][Tt].*|.*[Tt][Oo][Kk][Ee][Nn].*|.*[Aa][Pp][Ii][_-]?[Kk][Ee][Yy].*|.*[Pp][Rr][Ii][Vv][Aa][Tt][Ee][_-]?[Kk][Ee][Yy].*) ]]; then
+                local env_name="${BASH_REMATCH[1]}"
+                env_name="${env_name//\"/}"
+                env_name="${env_name//\'/}"
+
+                # Look ahead for value: (not valueFrom:)
+                # This is simplified - would need more context tracking for accuracy
+                warnings+=("Строка $line_num: ПРОВЕРЬТЕ: Env var '$env_name' может содержать секрет")
+                warnings+=("  Рекомендация: Используйте valueFrom.secretKeyRef вместо value")
+            fi
+
+            # Exit env section on dedent
+            if [[ "$line" =~ ^([[:space:]]*)[a-zA-Z] ]]; then
+                local current_indent=${#BASH_REMATCH[1]}
+                if [[ $current_indent -le $env_indent ]] && [[ ! "$line" =~ ^[[:space:]]*env: ]]; then
+                    in_env=0
+                fi
+            fi
+        fi
+
+        # Check for hardcoded credentials in any value
+        if [[ "$line" =~ value:[[:space:]]+(.*[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd].*=|.*[Tt][Oo][Kk][Ee][Nn].*=) ]]; then
+            warnings+=("Строка $line_num: ПРЕДУПРЕЖДЕНИЕ: Возможный hardcoded credential в value")
+        fi
+
+    done < "$file"
+
+    if [[ ${#warnings[@]} -gt 0 ]]; then
+        printf '%s\n' "${warnings[@]}"
+    fi
+    return 0
+}
+
+check_default_service_account() {
+    local file="$1"
+    local warnings=()
+    local has_service_account=0
+    local has_automount_false=0
+    local line_num=0
+    local detected_kind=""
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Skip comments
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+
+        # Detect workload kinds
+        if [[ "$line" =~ ^kind:[[:space:]]+(Deployment|StatefulSet|DaemonSet|Job|CronJob|Pod) ]]; then
+            detected_kind="${BASH_REMATCH[1]}"
+        fi
+
+        # Reset on document separator
+        if [[ "$line" =~ ^---[[:space:]]*$ ]]; then
+            # Check previous document
+            if [[ -n "$detected_kind" ]] && [[ $has_service_account -eq 0 ]] && [[ $has_automount_false -eq 0 ]]; then
+                # Only warn if it's a workload that might need service account check
+                :
+            fi
+            detected_kind=""
+            has_service_account=0
+            has_automount_false=0
+        fi
+
+        # Check for serviceAccountName
+        if [[ "$line" =~ serviceAccountName:[[:space:]]+([^[:space:]#]+) ]]; then
+            local sa_name="${BASH_REMATCH[1]}"
+            sa_name="${sa_name//\"/}"
+            sa_name="${sa_name//\'/}"
+
+            has_service_account=1
+
+            if [[ "$sa_name" == "default" ]]; then
+                warnings+=("Строка $line_num: ПРЕДУПРЕЖДЕНИЕ: serviceAccountName: default")
+                warnings+=("  Рекомендация: Создайте отдельный ServiceAccount с минимальными правами")
+            fi
+        fi
+
+        # Check for automountServiceAccountToken: false
+        if [[ "$line" =~ automountServiceAccountToken:[[:space:]]+(false|False|FALSE) ]]; then
+            has_automount_false=1
+        fi
+
+    done < "$file"
+
+    if [[ ${#warnings[@]} -gt 0 ]]; then
+        printf '%s\n' "${warnings[@]}"
+    fi
+    return 0
+}
+
 check_resource_format() {
     local file="$1"
     local line_num=0
@@ -3692,6 +4653,186 @@ check_embedded_json() {
     return 0
 }
 
+# B17: Check for floats without leading zero (e.g., .5 instead of 0.5)
+check_float_leading_zero() {
+    local file="$1"
+    local line_num=0
+    local warnings=()
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Skip comments and empty lines
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "${line// }" ]] && continue
+        # Skip multiline content
+        [[ "$line" == *": |"* ]] && continue
+        [[ "$line" == *": >"* ]] && continue
+
+        # Check for float values starting with . (no leading zero)
+        # Match: key: .5 or key: -.5
+        if [[ "$line" =~ :[[:space:]]+-?(\.[0-9]+)([[:space:]]|$|#) ]]; then
+            local value="${BASH_REMATCH[1]}"
+            # Check not in quotes
+            if [[ ! "$line" =~ :[[:space:]]+[\"\'].*${value}.*[\"\'] ]]; then
+                warnings+=("[WARNING] Строка $line_num: Float '$value' без ведущего нуля")
+                warnings+=("  Рекомендация: Используйте '0$value' для ясности")
+            fi
+        fi
+
+        # Also check in arrays: [.5, .25]
+        if [[ "$line" =~ \[.*[,[:space:]]-?(\.[0-9]+)[,\]] ]]; then
+            warnings+=("[WARNING] Строка $line_num: Float значение в массиве без ведущего нуля")
+            warnings+=("  Рекомендация: Используйте 0.x вместо .x")
+        fi
+    done < "$file"
+
+    if [[ ${#warnings[@]} -gt 0 ]]; then
+        printf '%s\n' "${warnings[@]}"
+    fi
+    return 0
+}
+
+# B18: Check for NaN/Inf values and optionally forbid them
+check_special_floats() {
+    local file="$1"
+    local strict="${2:-0}"  # 1 = forbid, 0 = warn only
+    local line_num=0
+    local warnings=()
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Skip comments
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+
+        # Check for infinity values
+        if [[ "$line" =~ :[[:space:]]+(\.inf|\.Inf|\.INF|-\.inf|-\.Inf|-\.INF|\+\.inf|\+\.Inf|\+\.INF)([[:space:]]|$|#) ]]; then
+            local value="${BASH_REMATCH[1]}"
+            if [[ $strict -eq 1 ]]; then
+                warnings+=("[ERROR] Строка $line_num: Infinity '$value' запрещено в strict режиме")
+            else
+                warnings+=("[INFO] Строка $line_num: Infinity значение '$value' - убедитесь, что это намеренно")
+            fi
+        fi
+
+        # Check for NaN values
+        if [[ "$line" =~ :[[:space:]]+(\.nan|\.NaN|\.NAN)([[:space:]]|$|#) ]]; then
+            local value="${BASH_REMATCH[1]}"
+            if [[ $strict -eq 1 ]]; then
+                warnings+=("[ERROR] Строка $line_num: NaN '$value' запрещено в strict режиме")
+            else
+                warnings+=("[INFO] Строка $line_num: NaN значение '$value' - убедитесь, что это намеренно")
+            fi
+        fi
+    done < "$file"
+
+    if [[ ${#warnings[@]} -gt 0 ]]; then
+        printf '%s\n' "${warnings[@]}"
+    fi
+    return 0
+}
+
+# B19: Check maximum nesting depth
+check_nesting_depth() {
+    local file="$1"
+    local max_depth="${2:-10}"  # Default max 10 levels
+    local line_num=0
+    local warnings=()
+    local max_found=0
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Skip comments and empty lines
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "${line// }" ]] && continue
+
+        # Calculate indentation (assume 2 spaces per level)
+        local stripped="${line#"${line%%[![:space:]]*}"}"
+        local indent=$((${#line} - ${#stripped}))
+        local depth=$((indent / 2))
+
+        # Track maximum depth
+        if [[ $depth -gt $max_found ]]; then
+            max_found=$depth
+        fi
+
+        # Warn if exceeds threshold
+        if [[ $depth -gt $max_depth ]]; then
+            warnings+=("[WARNING] Строка $line_num: Глубина вложенности ($depth) превышает рекомендуемый максимум ($max_depth)")
+            warnings+=("  Рекомендация: Рассмотрите рефакторинг или использование якорей/алиасов")
+        fi
+    done < "$file"
+
+    # Summary warning
+    if [[ $max_found -gt $max_depth ]]; then
+        warnings+=("[WARNING] Максимальная глубина вложенности в файле: $max_found (рекомендуется не более $max_depth)")
+    fi
+
+    if [[ ${#warnings[@]} -gt 0 ]]; then
+        printf '%s\n' "${warnings[@]}"
+    fi
+    return 0
+}
+
+# B20: Check for Unicode normalization issues
+check_unicode_normalization() {
+    local file="$1"
+    local line_num=0
+    local warnings=()
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Skip empty lines
+        [[ -z "$line" ]] && continue
+
+        # Check for common Unicode issues:
+
+        # 1. Zero-width characters (invisible but problematic)
+        if [[ "$line" =~ $'\u200B' ]] || [[ "$line" =~ $'\u200C' ]] || [[ "$line" =~ $'\u200D' ]] || [[ "$line" =~ $'\uFEFF' ]]; then
+            warnings+=("[WARNING] Строка $line_num: Обнаружены zero-width символы (невидимые Unicode)")
+            warnings+=("  Это может вызвать проблемы парсинга или сравнения строк")
+        fi
+
+        # 2. Homoglyphs in ASCII-looking content (Cyrillic а/о/е/с looks like Latin)
+        # Check if line has key: pattern with mixed scripts
+        if [[ "$line" =~ ^[[:space:]]*([^:]+): ]]; then
+            local key="${BASH_REMATCH[1]}"
+            # Check for Cyrillic characters in what looks like ASCII key
+            if [[ "$key" =~ [а-яА-ЯёЁ] ]] && [[ "$key" =~ [a-zA-Z] ]]; then
+                warnings+=("[WARNING] Строка $line_num: Смешение латиницы и кириллицы в ключе '$key'")
+                warnings+=("  Возможно использование похожих символов (homoglyphs)")
+            fi
+        fi
+
+        # 3. Non-breaking space instead of regular space
+        if [[ "$line" =~ $'\u00A0' ]]; then
+            warnings+=("[WARNING] Строка $line_num: Обнаружен неразрывный пробел (U+00A0)")
+            warnings+=("  Это может вызвать проблемы в YAML отступах")
+        fi
+
+        # 4. Different dash types
+        if [[ "$line" =~ [–—] ]] && [[ "$line" =~ ^[[:space:]]*[–—] ]]; then
+            warnings+=("[WARNING] Строка $line_num: Использован длинное тире (en/em-dash) вместо дефиса в начале")
+            warnings+=("  YAML требует обычный дефис (-) для списков")
+        fi
+
+        # 5. Full-width characters
+        if [[ "$line" =~ [：＝] ]]; then
+            warnings+=("[WARNING] Строка $line_num: Обнаружены full-width символы (: или =)")
+            warnings+=("  Используйте обычные ASCII двоеточия и равно")
+        fi
+
+    done < "$file"
+
+    if [[ ${#warnings[@]} -gt 0 ]]; then
+        printf '%s\n' "${warnings[@]}"
+    fi
+    return 0
+}
+
 # NEW CHECK: Networking and protocol values
 check_network_values() {
     local file="$1"
@@ -3786,10 +4927,885 @@ check_key_naming() {
     return 0
 }
 
+# === YAMLLINT-COMPATIBLE CHECKS (v2.6.0) ===
+
+check_line_length() {
+    local file="$1"
+    local max_length="${2:-120}"  # Default 120, yamllint default is 80
+    local line_num=0
+    local warnings=()
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        local line_len=${#line}
+        if [[ $line_len -gt $max_length ]]; then
+            warnings+=("Строка $line_num: Длина строки $line_len > $max_length символов")
+            warnings+=("  Рекомендация: Разбейте на несколько строк для читаемости")
+        fi
+    done < "$file"
+
+    if [[ ${#warnings[@]} -gt 0 ]]; then
+        printf '%s\n' "${warnings[@]}"
+    fi
+    return 0
+}
+
+check_comment_format() {
+    local file="$1"
+    local line_num=0
+    local warnings=()
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Check for comments without space after #
+        # Skip shebang and YAML directives
+        if [[ "$line" =~ ^[[:space:]]*#[^[:space:]!%] ]]; then
+            # Not: # comment (space), #! shebang, #% directive
+            warnings+=("Строка $line_num: Комментарий без пробела после #")
+            warnings+=("  Было: ${line:0:50}...")
+            warnings+=("  Рекомендация: Добавьте пробел после #")
+        fi
+
+        # Check for inline comment without space before #
+        if [[ "$line" =~ [^[:space:]]#[[:space:]] ]] && [[ ! "$line" =~ ^[[:space:]]*# ]]; then
+            # Skip URLs and other valid uses of # in strings
+            if [[ ! "$line" =~ https?:// ]] && [[ ! "$line" =~ [\"\'][^\"\']*#[^\"\']*[\"\'] ]]; then
+                warnings+=("Строка $line_num: Inline комментарий без пробела перед #")
+            fi
+        fi
+    done < "$file"
+
+    if [[ ${#warnings[@]} -gt 0 ]]; then
+        printf '%s\n' "${warnings[@]}"
+    fi
+    return 0
+}
+
+# A14: Comment indentation check (yamllint comments-indentation)
+# Comments should be indented like content around them
+check_comment_indentation() {
+    local file="$1"
+    local line_num=0
+    local warnings=()
+    local prev_indent=0
+    local prev_is_comment=0
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Skip empty lines for indentation tracking
+        if [[ -z "${line// }" ]] || [[ "$line" =~ ^[[:space:]]*$ ]]; then
+            continue
+        fi
+
+        # Calculate current line indentation
+        local stripped="${line#"${line%%[![:space:]]*}"}"
+        local current_indent=$((${#line} - ${#stripped}))
+
+        # Check if current line is a comment
+        if [[ "$line" =~ ^[[:space:]]*# ]]; then
+            # Skip document start marker comments
+            if [[ "$line" =~ ^#.*--- ]] || [[ "$line" =~ ^#.*\.\.\. ]]; then
+                prev_indent=$current_indent
+                prev_is_comment=1
+                continue
+            fi
+
+            # If previous non-empty line was not a comment, check indentation
+            if [[ $prev_is_comment -eq 0 && $prev_indent -gt 0 ]]; then
+                # Comment should match previous content indentation OR be at column 0
+                if [[ $current_indent -ne $prev_indent && $current_indent -ne 0 ]]; then
+                    # Check if it might be a block comment (next content has different indent)
+                    warnings+=("[INFO] Строка $line_num: Отступ комментария ($current_indent) не совпадает с окружающим кодом ($prev_indent)")
+                fi
+            fi
+
+            prev_is_comment=1
+        else
+            # Content line after comment - comment should have matched this line's indent
+            if [[ $prev_is_comment -eq 1 && $prev_indent -ne $current_indent && $prev_indent -ne 0 ]]; then
+                # Previous comment had wrong indentation relative to this content
+                local comment_line=$((line_num - 1))
+                warnings+=("[INFO] Строка $comment_line: Комментарий с отступом ($prev_indent) перед содержимым с отступом ($current_indent)")
+            fi
+            prev_is_comment=0
+        fi
+
+        prev_indent=$current_indent
+    done < "$file"
+
+    if [[ ${#warnings[@]} -gt 0 ]]; then
+        printf '%s\n' "${warnings[@]}"
+    fi
+    return 0
+}
+
+check_empty_lines() {
+    local file="$1"
+    local max_empty="${2:-2}"  # Default max 2 consecutive empty lines
+    local line_num=0
+    local empty_count=0
+    local warnings=()
+    local empty_start=0
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        if [[ -z "${line// }" ]] || [[ "$line" =~ ^[[:space:]]*$ ]]; then
+            ((empty_count++))
+            if [[ $empty_count -eq 1 ]]; then
+                empty_start=$line_num
+            fi
+        else
+            if [[ $empty_count -gt $max_empty ]]; then
+                warnings+=("Строки $empty_start-$((line_num-1)): $empty_count подряд пустых строк (max: $max_empty)")
+            fi
+            empty_count=0
+        fi
+    done < "$file"
+
+    # Check at end of file
+    if [[ $empty_count -gt $max_empty ]]; then
+        warnings+=("Строки $empty_start-$line_num: $empty_count подряд пустых строк в конце файла")
+    fi
+
+    if [[ ${#warnings[@]} -gt 0 ]]; then
+        printf '%s\n' "${warnings[@]}"
+    fi
+    return 0
+}
+
+check_newline_at_eof() {
+    local file="$1"
+    local warnings=()
+
+    # Check if file ends with newline
+    if [[ -s "$file" ]]; then
+        local last_char
+        last_char=$(tail -c 1 "$file" | od -An -tx1 | tr -d ' ')
+
+        if [[ "$last_char" != "0a" ]] && [[ "$last_char" != "" ]]; then
+            warnings+=("ПРЕДУПРЕЖДЕНИЕ: Файл не заканчивается символом новой строки")
+            warnings+=("  POSIX: Текстовые файлы должны заканчиваться newline")
+            warnings+=("  Исправление: echo >> $file")
+        fi
+    fi
+
+    if [[ ${#warnings[@]} -gt 0 ]]; then
+        printf '%s\n' "${warnings[@]}"
+    fi
+    return 0
+}
+
+check_colons_spacing() {
+    local file="$1"
+    local line_num=0
+    local warnings=()
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Skip comments
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+
+        # Check for colon without space after (except in URLs, times, port numbers)
+        # Pattern: key:value (no space after colon)
+        if [[ "$line" =~ ^[[:space:]]*[a-zA-Z_][a-zA-Z0-9_-]*:[^[:space:]] ]]; then
+            # Skip if it's a URL or port
+            if [[ ! "$line" =~ (https?://|:[0-9]+) ]]; then
+                local key_part="${line%%:*}"
+                key_part="${key_part#"${key_part%%[![:space:]]*}"}"  # trim leading spaces
+                # Additional check to avoid false positives on flow style
+                if [[ ! "$line" =~ :[[:space:]]*[\[\{] ]]; then
+                    warnings+=("Строка $line_num: Отсутствует пробел после двоеточия")
+                    warnings+=("  Строка: ${line:0:60}...")
+                fi
+            fi
+        fi
+
+        # Check for space before colon in key:value
+        if [[ "$line" =~ ^[[:space:]]*[a-zA-Z_][a-zA-Z0-9_-]*[[:space:]]+: ]]; then
+            warnings+=("Строка $line_num: Лишний пробел перед двоеточием")
+        fi
+    done < "$file"
+
+    if [[ ${#warnings[@]} -gt 0 ]]; then
+        printf '%s\n' "${warnings[@]}"
+    fi
+    return 0
+}
+
+check_brackets_spacing() {
+    local file="$1"
+    local line_num=0
+    local warnings=()
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Skip comments
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+
+        # Check for space after [ or {
+        if [[ "$line" =~ \[[[:space:]]{2,} ]] || [[ "$line" =~ \{[[:space:]]{2,} ]]; then
+            warnings+=("Строка $line_num: Лишние пробелы после открывающей скобки")
+        fi
+
+        # Check for space before ] or }
+        if [[ "$line" =~ [[:space:]]{2,}\] ]] || [[ "$line" =~ [[:space:]]{2,}\} ]]; then
+            warnings+=("Строка $line_num: Лишние пробелы перед закрывающей скобкой")
+        fi
+
+        # Check for missing space after comma in arrays
+        if [[ "$line" =~ \[[^\]]*,[^[:space:]] ]]; then
+            # Skip if it's not a flow-style array
+            if [[ "$line" =~ \[[^\]]+\] ]]; then
+                warnings+=("Строка $line_num: Отсутствует пробел после запятой в массиве")
+            fi
+        fi
+    done < "$file"
+
+    if [[ ${#warnings[@]} -gt 0 ]]; then
+        printf '%s\n' "${warnings[@]}"
+    fi
+    return 0
+}
+
+check_truthy_values() {
+    local file="$1"
+    local line_num=0
+    local warnings=()
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Skip comments
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+
+        # Check for truthy values that should be quoted or explicit true/false
+        # yamllint truthy rule: warn about yes/no/on/off/y/n
+        if [[ "$line" =~ :[[:space:]]+(yes|Yes|YES|no|No|NO|on|On|ON|off|Off|OFF)[[:space:]]*$ ]]; then
+            local value="${BASH_REMATCH[1]}"
+            warnings+=("Строка $line_num: Truthy value '$value' — неоднозначно")
+            warnings+=("  YAML 1.1: Интерпретируется как boolean")
+            warnings+=("  Рекомендация: Используйте true/false или заключите в кавычки")
+        fi
+
+        # Check for y/n (single letter)
+        if [[ "$line" =~ :[[:space:]]+(y|Y|n|N)[[:space:]]*$ ]]; then
+            local value="${BASH_REMATCH[1]}"
+            warnings+=("Строка $line_num: Single letter '$value' — может быть boolean в YAML 1.1")
+            warnings+=("  Рекомендация: Заключите в кавычки если это строка")
+        fi
+    done < "$file"
+
+    if [[ ${#warnings[@]} -gt 0 ]]; then
+        printf '%s\n' "${warnings[@]}"
+    fi
+    return 0
+}
+
+# =============================================================================
+# A18: K8s Key Ordering Convention (OPTIONAL)
+# =============================================================================
+# K8s convention: apiVersion → kind → metadata → spec → data/stringData → status
+check_key_ordering() {
+    local file="$1"
+    local warnings=()
+
+    # K8s top-level key order convention
+    declare -A KEY_ORDER
+    KEY_ORDER[apiVersion]=1
+    KEY_ORDER[kind]=2
+    KEY_ORDER[metadata]=3
+    KEY_ORDER[spec]=4
+    KEY_ORDER[data]=5
+    KEY_ORDER[stringData]=5
+    KEY_ORDER[status]=6
+    KEY_ORDER[rules]=5        # For RBAC
+    KEY_ORDER[subjects]=6     # For RoleBinding
+    KEY_ORDER[roleRef]=7      # For RoleBinding
+
+    local prev_order=0
+    local prev_key=""
+    local line_num=0
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Document separator - reset
+        if [[ "$line" =~ ^--- ]]; then
+            prev_order=0
+            prev_key=""
+            continue
+        fi
+
+        # Skip comments and empty lines
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "${line// }" ]] && continue
+
+        # Only check top-level keys (no leading whitespace)
+        if [[ "$line" =~ ^([a-zA-Z][a-zA-Z0-9]*): ]]; then
+            local key="${BASH_REMATCH[1]}"
+            local order="${KEY_ORDER[$key]:-99}"
+
+            if [[ $order -lt $prev_order && $prev_order -ne 99 && $order -ne 99 ]]; then
+                warnings+=("[INFO] Строка $line_num: Порядок ключей: '$key' должен быть перед '$prev_key'")
+                warnings+=("  K8s конвенция: apiVersion → kind → metadata → spec → data → status")
+            fi
+
+            prev_order=$order
+            prev_key="$key"
+        fi
+    done < "$file"
+
+    if [[ ${#warnings[@]} -gt 0 ]]; then
+        printf '%s\n' "${warnings[@]}"
+    fi
+    return 0
+}
+
+# =============================================================================
+# C31-C33: Partial Schema Validation (OPTIONAL)
+# =============================================================================
+
+# C31: Field type validation for common K8s fields
+check_field_types() {
+    local file="$1"
+    local line_num=0
+    local errors=()
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Skip comments
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+
+        # replicas should be integer
+        if [[ "$line" =~ replicas:[[:space:]]+([^[:space:]#]+) ]]; then
+            local value="${BASH_REMATCH[1]}"
+            if [[ ! "$value" =~ ^[0-9]+$ ]]; then
+                errors+=("[ERROR] Строка $line_num: replicas должен быть integer, найдено: '$value'")
+            fi
+        fi
+
+        # containerPort should be integer 1-65535
+        if [[ "$line" =~ containerPort:[[:space:]]+([^[:space:]#]+) ]]; then
+            local value="${BASH_REMATCH[1]}"
+            if [[ ! "$value" =~ ^[0-9]+$ ]]; then
+                errors+=("[ERROR] Строка $line_num: containerPort должен быть integer, найдено: '$value'")
+            elif [[ $value -lt 1 || $value -gt 65535 ]]; then
+                errors+=("[ERROR] Строка $line_num: containerPort должен быть 1-65535, найдено: $value")
+            fi
+        fi
+
+        # port (in Service) should be integer
+        if [[ "$line" =~ ^[[:space:]]+port:[[:space:]]+([^[:space:]#]+) ]]; then
+            local value="${BASH_REMATCH[1]}"
+            if [[ ! "$value" =~ ^[0-9]+$ ]]; then
+                errors+=("[ERROR] Строка $line_num: port должен быть integer, найдено: '$value'")
+            fi
+        fi
+
+        # targetPort can be integer or string (named port)
+        # minReplicas/maxReplicas in HPA
+        if [[ "$line" =~ (minReplicas|maxReplicas):[[:space:]]+([^[:space:]#]+) ]]; then
+            local field="${BASH_REMATCH[1]}"
+            local value="${BASH_REMATCH[2]}"
+            if [[ ! "$value" =~ ^[0-9]+$ ]]; then
+                errors+=("[ERROR] Строка $line_num: $field должен быть integer, найдено: '$value'")
+            fi
+        fi
+
+        # terminationGracePeriodSeconds should be integer
+        if [[ "$line" =~ terminationGracePeriodSeconds:[[:space:]]+([^[:space:]#]+) ]]; then
+            local value="${BASH_REMATCH[1]}"
+            if [[ ! "$value" =~ ^[0-9]+$ ]]; then
+                errors+=("[ERROR] Строка $line_num: terminationGracePeriodSeconds должен быть integer")
+            fi
+        fi
+
+        # revisionHistoryLimit should be integer
+        if [[ "$line" =~ revisionHistoryLimit:[[:space:]]+([^[:space:]#]+) ]]; then
+            local value="${BASH_REMATCH[1]}"
+            if [[ ! "$value" =~ ^[0-9]+$ ]]; then
+                errors+=("[ERROR] Строка $line_num: revisionHistoryLimit должен быть integer")
+            fi
+        fi
+    done < "$file"
+
+    if [[ ${#errors[@]} -gt 0 ]]; then
+        printf '%s\n' "${errors[@]}"
+        return 1
+    fi
+    return 0
+}
+
+# C32: Enum value validation
+check_enum_values() {
+    local file="$1"
+    local line_num=0
+    local errors=()
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Skip comments
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+
+        # restartPolicy: Always | OnFailure | Never
+        if [[ "$line" =~ restartPolicy:[[:space:]]+([^[:space:]#]+) ]]; then
+            local value="${BASH_REMATCH[1]}"
+            value="${value//\"/}"
+            value="${value//\'/}"
+            if [[ ! "$value" =~ ^(Always|OnFailure|Never)$ ]]; then
+                errors+=("[ERROR] Строка $line_num: restartPolicy должен быть Always|OnFailure|Never, найдено: '$value'")
+            fi
+        fi
+
+        # imagePullPolicy: Always | IfNotPresent | Never
+        if [[ "$line" =~ imagePullPolicy:[[:space:]]+([^[:space:]#]+) ]]; then
+            local value="${BASH_REMATCH[1]}"
+            value="${value//\"/}"
+            value="${value//\'/}"
+            if [[ ! "$value" =~ ^(Always|IfNotPresent|Never)$ ]]; then
+                errors+=("[ERROR] Строка $line_num: imagePullPolicy должен быть Always|IfNotPresent|Never, найдено: '$value'")
+            fi
+        fi
+
+        # type (Service): ClusterIP | NodePort | LoadBalancer | ExternalName
+        if [[ "$line" =~ ^[[:space:]]+type:[[:space:]]+([^[:space:]#]+) ]]; then
+            local value="${BASH_REMATCH[1]}"
+            # Only check if it looks like a Service type (common values)
+            if [[ "$value" =~ ^(ClusterIP|NodePort|LoadBalancer|ExternalName|clusterip|nodeport|loadbalancer)$ ]]; then
+                # Valid, but check case
+                if [[ ! "$value" =~ ^(ClusterIP|NodePort|LoadBalancer|ExternalName)$ ]]; then
+                    errors+=("[WARNING] Строка $line_num: Service type неправильный регистр: '$value'")
+                fi
+            fi
+        fi
+
+        # protocol: TCP | UDP | SCTP
+        if [[ "$line" =~ protocol:[[:space:]]+([^[:space:]#]+) ]]; then
+            local value="${BASH_REMATCH[1]}"
+            value="${value//\"/}"
+            value="${value//\'/}"
+            if [[ ! "$value" =~ ^(TCP|UDP|SCTP)$ ]]; then
+                errors+=("[ERROR] Строка $line_num: protocol должен быть TCP|UDP|SCTP, найдено: '$value'")
+            fi
+        fi
+
+        # strategy.type (Deployment): Recreate | RollingUpdate
+        if [[ "$line" =~ ^[[:space:]]+type:[[:space:]]+(Recreate|RollingUpdate|recreate|rollingupdate)[[:space:]]*$ ]]; then
+            local value="${BASH_REMATCH[1]}"
+            if [[ ! "$value" =~ ^(Recreate|RollingUpdate)$ ]]; then
+                errors+=("[WARNING] Строка $line_num: strategy.type неправильный регистр: '$value'")
+            fi
+        fi
+
+        # concurrencyPolicy (CronJob): Allow | Forbid | Replace
+        if [[ "$line" =~ concurrencyPolicy:[[:space:]]+([^[:space:]#]+) ]]; then
+            local value="${BASH_REMATCH[1]}"
+            if [[ ! "$value" =~ ^(Allow|Forbid|Replace)$ ]]; then
+                errors+=("[ERROR] Строка $line_num: concurrencyPolicy должен быть Allow|Forbid|Replace, найдено: '$value'")
+            fi
+        fi
+
+        # dnsPolicy: Default | ClusterFirst | ClusterFirstWithHostNet | None
+        if [[ "$line" =~ dnsPolicy:[[:space:]]+([^[:space:]#]+) ]]; then
+            local value="${BASH_REMATCH[1]}"
+            if [[ ! "$value" =~ ^(Default|ClusterFirst|ClusterFirstWithHostNet|None)$ ]]; then
+                errors+=("[ERROR] Строка $line_num: dnsPolicy должен быть Default|ClusterFirst|ClusterFirstWithHostNet|None")
+            fi
+        fi
+    done < "$file"
+
+    if [[ ${#errors[@]} -gt 0 ]]; then
+        printf '%s\n' "${errors[@]}"
+        return 1
+    fi
+    return 0
+}
+
+# C33: Required nested fields validation
+check_required_nested() {
+    local file="$1"
+    local errors=()
+    local content
+    content=$(cat "$file")
+
+    # Check Deployment/StatefulSet has spec.selector
+    if [[ "$content" =~ kind:[[:space:]]*(Deployment|StatefulSet|ReplicaSet|DaemonSet) ]]; then
+        if [[ ! "$content" =~ selector: ]]; then
+            errors+=("[ERROR] Deployment/StatefulSet/ReplicaSet/DaemonSet требует spec.selector")
+        fi
+    fi
+
+    # Check Service has spec.ports
+    if [[ "$content" =~ kind:[[:space:]]*Service ]] && [[ ! "$content" =~ kind:[[:space:]]*ServiceAccount ]]; then
+        if [[ ! "$content" =~ ports: ]]; then
+            errors+=("[WARNING] Service обычно требует spec.ports")
+        fi
+    fi
+
+    # Check Ingress has rules
+    if [[ "$content" =~ kind:[[:space:]]*Ingress ]]; then
+        if [[ ! "$content" =~ rules: ]]; then
+            errors+=("[WARNING] Ingress обычно требует spec.rules")
+        fi
+    fi
+
+    # Check ConfigMap has data or binaryData
+    if [[ "$content" =~ kind:[[:space:]]*ConfigMap ]]; then
+        if [[ ! "$content" =~ (data:|binaryData:) ]]; then
+            errors+=("[WARNING] ConfigMap обычно требует data или binaryData")
+        fi
+    fi
+
+    # Check container has name and image
+    if [[ "$content" =~ containers: ]]; then
+        # Simple check - containers should have - name: and image:
+        if [[ ! "$content" =~ -[[:space:]]*name: ]]; then
+            errors+=("[ERROR] Контейнеры требуют name")
+        fi
+        # Image can be omitted in some cases, so just warning
+    fi
+
+    if [[ ${#errors[@]} -gt 0 ]]; then
+        printf '%s\n' "${errors[@]}"
+    fi
+    return 0
+}
+
+# =============================================================================
+# E8-E19: Best Practices Checks
+# =============================================================================
+
+# E8: Replicas < 3 for HA
+check_replicas_ha() {
+    local file="$1"
+    local line_num=0
+    local warnings=()
+    local kind=""
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Track kind
+        if [[ "$line" =~ ^kind:[[:space:]]+([^[:space:]#]+) ]]; then
+            kind="${BASH_REMATCH[1]}"
+        fi
+
+        # Check replicas for Deployment/StatefulSet
+        if [[ "$line" =~ replicas:[[:space:]]+([0-9]+) ]]; then
+            local replicas="${BASH_REMATCH[1]}"
+            if [[ "$kind" =~ ^(Deployment|StatefulSet)$ ]] && [[ $replicas -lt 3 ]]; then
+                warnings+=("[INFO] Строка $line_num: replicas: $replicas — для HA рекомендуется минимум 3")
+                warnings+=("  Kind: $kind")
+            fi
+        fi
+    done < "$file"
+
+    if [[ ${#warnings[@]} -gt 0 ]]; then
+        printf '%s\n' "${warnings[@]}"
+    fi
+    return 0
+}
+
+# E9: Missing anti-affinity for HA
+check_anti_affinity() {
+    local file="$1"
+    local warnings=()
+    local content
+    content=$(cat "$file")
+
+    # Check if it's a Deployment or StatefulSet with replicas > 1
+    if [[ "$content" =~ kind:[[:space:]]*(Deployment|StatefulSet) ]]; then
+        local kind="${BASH_REMATCH[1]}"
+        if [[ "$content" =~ replicas:[[:space:]]*([0-9]+) ]]; then
+            local replicas="${BASH_REMATCH[1]}"
+            if [[ $replicas -gt 1 ]]; then
+                # Check for podAntiAffinity
+                if [[ ! "$content" =~ podAntiAffinity: ]]; then
+                    warnings+=("[INFO] $kind с replicas: $replicas без podAntiAffinity")
+                    warnings+=("  Рекомендация: Добавьте podAntiAffinity для распределения по нодам")
+                fi
+            fi
+        fi
+    fi
+
+    if [[ ${#warnings[@]} -gt 0 ]]; then
+        printf '%s\n' "${warnings[@]}"
+    fi
+    return 0
+}
+
+# E10: No rolling update strategy
+check_rolling_update() {
+    local file="$1"
+    local warnings=()
+    local content
+    content=$(cat "$file")
+
+    # Check Deployment has strategy
+    if [[ "$content" =~ kind:[[:space:]]*Deployment ]]; then
+        if [[ ! "$content" =~ strategy: ]]; then
+            warnings+=("[INFO] Deployment без явной strategy")
+            warnings+=("  По умолчанию: RollingUpdate, но лучше указать явно")
+        elif [[ "$content" =~ type:[[:space:]]*Recreate ]]; then
+            warnings+=("[WARNING] Deployment использует strategy: Recreate")
+            warnings+=("  Риск: Downtime при обновлении")
+            warnings+=("  Рекомендация: Используйте RollingUpdate для zero-downtime")
+        fi
+    fi
+
+    if [[ ${#warnings[@]} -gt 0 ]]; then
+        printf '%s\n' "${warnings[@]}"
+    fi
+    return 0
+}
+
+# E15: Duplicate env vars
+check_duplicate_env() {
+    local file="$1"
+    local line_num=0
+    local errors=()
+    local in_env=0
+    local env_names=()
+    local container_name=""
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Track container name
+        if [[ "$line" =~ ^[[:space:]]*-[[:space:]]*name:[[:space:]]+([^[:space:]#]+) ]]; then
+            # Could be container or env var name
+            if [[ $in_env -eq 0 ]]; then
+                container_name="${BASH_REMATCH[1]}"
+            fi
+        fi
+
+        # Track env section
+        if [[ "$line" =~ ^[[:space:]]+env:[[:space:]]*$ ]]; then
+            in_env=1
+            env_names=()
+            continue
+        fi
+
+        # Exit env section on unindent or new section
+        if [[ $in_env -eq 1 ]]; then
+            if [[ "$line" =~ ^[[:space:]]{6}[a-zA-Z] ]] && [[ ! "$line" =~ ^[[:space:]]*- ]]; then
+                in_env=0
+                env_names=()
+            fi
+
+            # Check env var name
+            if [[ "$line" =~ ^[[:space:]]*-[[:space:]]*name:[[:space:]]+([^[:space:]#]+) ]]; then
+                local env_name="${BASH_REMATCH[1]}"
+                env_name="${env_name//\"/}"
+                env_name="${env_name//\'/}"
+
+                # Check for duplicate
+                for existing in "${env_names[@]}"; do
+                    if [[ "$existing" == "$env_name" ]]; then
+                        errors+=("[ERROR] Строка $line_num: Дубликат env переменной: '$env_name'")
+                        errors+=("  Контейнер: $container_name")
+                    fi
+                done
+                env_names+=("$env_name")
+            fi
+        fi
+    done < "$file"
+
+    if [[ ${#errors[@]} -gt 0 ]]; then
+        printf '%s\n' "${errors[@]}"
+        return 1
+    fi
+    return 0
+}
+
+# E16: Missing namespace
+check_missing_namespace() {
+    local file="$1"
+    local warnings=()
+    local content
+    content=$(cat "$file")
+
+    # Skip cluster-scoped resources
+    if [[ "$content" =~ kind:[[:space:]]*(Namespace|ClusterRole|ClusterRoleBinding|PersistentVolume|StorageClass|CustomResourceDefinition|Node) ]]; then
+        return 0
+    fi
+
+    # Check for namespace in metadata
+    if [[ ! "$content" =~ namespace:[[:space:]]+ ]]; then
+        if [[ "$content" =~ kind:[[:space:]]+([^[:space:]#]+) ]]; then
+            local kind="${BASH_REMATCH[1]}"
+            warnings+=("[INFO] $kind без явного namespace")
+            warnings+=("  Будет создан в default или текущем namespace контекста")
+            warnings+=("  Рекомендация: Явно укажите metadata.namespace")
+        fi
+    fi
+
+    if [[ ${#warnings[@]} -gt 0 ]]; then
+        printf '%s\n' "${warnings[@]}"
+    fi
+    return 0
+}
+
+# E17: Priority class not set
+check_priority_class() {
+    local file="$1"
+    local warnings=()
+    local content
+    content=$(cat "$file")
+
+    # Check workloads
+    if [[ "$content" =~ kind:[[:space:]]*(Deployment|StatefulSet|DaemonSet|Job|CronJob) ]]; then
+        local kind="${BASH_REMATCH[1]}"
+        if [[ ! "$content" =~ priorityClassName: ]]; then
+            warnings+=("[INFO] $kind без priorityClassName")
+            warnings+=("  Рекомендация: Установите priorityClassName для управления приоритетом Pod")
+        fi
+    fi
+
+    if [[ ${#warnings[@]} -gt 0 ]]; then
+        printf '%s\n' "${warnings[@]}"
+    fi
+    return 0
+}
+
+# E18: Probe ports validation (httpGet.port должен быть в ports[])
+check_probe_ports() {
+    local file="$1"
+    local warnings=()
+    local ports=()
+    local probe_ports=()
+    local line_num=0
+
+    # First pass: collect all containerPort values
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" =~ containerPort:[[:space:]]+([0-9]+) ]]; then
+            ports+=("${BASH_REMATCH[1]}")
+        fi
+        if [[ "$line" =~ ^[[:space:]]+port:[[:space:]]+([0-9]+) ]] && [[ "$line" =~ httpGet|tcpSocket ]]; then
+            probe_ports+=("${BASH_REMATCH[1]}")
+        fi
+    done < "$file"
+
+    # Second pass: check probe ports
+    line_num=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Check httpGet port
+        if [[ "$line" =~ port:[[:space:]]+([0-9]+) ]]; then
+            local probe_port="${BASH_REMATCH[1]}"
+            # Check if this port exists in containerPorts (simple check)
+            local found=0
+            for p in "${ports[@]}"; do
+                if [[ "$p" == "$probe_port" ]]; then
+                    found=1
+                    break
+                fi
+            done
+            # Only warn if we have ports defined and this port isn't in them
+            if [[ ${#ports[@]} -gt 0 && $found -eq 0 ]]; then
+                # This might be a named port, so just info
+                warnings+=("[INFO] Строка $line_num: Probe port $probe_port может не соответствовать containerPort")
+            fi
+        fi
+    done < "$file"
+
+    if [[ ${#warnings[@]} -gt 0 ]]; then
+        printf '%s\n' "${warnings[@]}"
+    fi
+    return 0
+}
+
+# E19: Missing owner label
+check_owner_label() {
+    local file="$1"
+    local warnings=()
+    local content
+    content=$(cat "$file")
+
+    # Check for common ownership labels
+    if [[ "$content" =~ kind:[[:space:]]*(Deployment|StatefulSet|Service|ConfigMap|Secret) ]]; then
+        local kind="${BASH_REMATCH[1]}"
+        local has_owner=0
+
+        # Check for various ownership label patterns
+        [[ "$content" =~ app\.kubernetes\.io/managed-by: ]] && has_owner=1
+        [[ "$content" =~ app\.kubernetes\.io/owner: ]] && has_owner=1
+        [[ "$content" =~ owner: ]] && has_owner=1
+        [[ "$content" =~ team: ]] && has_owner=1
+        [[ "$content" =~ maintainer: ]] && has_owner=1
+
+        if [[ $has_owner -eq 0 ]]; then
+            warnings+=("[INFO] $kind без метки владельца")
+            warnings+=("  Рекомендация: Добавьте app.kubernetes.io/managed-by или team/owner label")
+        fi
+    fi
+
+    if [[ ${#warnings[@]} -gt 0 ]]; then
+        printf '%s\n' "${warnings[@]}"
+    fi
+    return 0
+}
+
+# E11-E14: Dangling resources (requires multi-file analysis)
+# These are implemented as single-file heuristics
+check_dangling_resources() {
+    local file="$1"
+    local warnings=()
+    local content
+    content=$(cat "$file")
+
+    # E11: Dangling Service - Service without matching Pod selector
+    # (Can only check if selector is defined, not if Pods exist)
+    if [[ "$content" =~ kind:[[:space:]]*Service ]] && [[ ! "$content" =~ kind:[[:space:]]*ServiceAccount ]]; then
+        if [[ ! "$content" =~ selector: ]]; then
+            warnings+=("[WARNING] Service без selector — может быть dangling")
+            warnings+=("  Рекомендация: Укажите selector для связи с Pods")
+        fi
+    fi
+
+    # E12: Ingress без backend service (простая проверка)
+    if [[ "$content" =~ kind:[[:space:]]*Ingress ]]; then
+        if [[ ! "$content" =~ (backend:|service:) ]]; then
+            warnings+=("[WARNING] Ingress без явного backend — может быть dangling")
+        fi
+    fi
+
+    # E13: HPA without matching target
+    if [[ "$content" =~ kind:[[:space:]]*HorizontalPodAutoscaler ]]; then
+        if [[ ! "$content" =~ scaleTargetRef: ]]; then
+            warnings+=("[ERROR] HPA без scaleTargetRef — dangling!")
+        fi
+    fi
+
+    # E14: NetworkPolicy without podSelector
+    if [[ "$content" =~ kind:[[:space:]]*NetworkPolicy ]]; then
+        if [[ ! "$content" =~ podSelector: ]]; then
+            warnings+=("[WARNING] NetworkPolicy без podSelector")
+        fi
+    fi
+
+    if [[ ${#warnings[@]} -gt 0 ]]; then
+        printf '%s\n' "${warnings[@]}"
+    fi
+    return 0
+}
+
 validate_yaml_file() {
     local file="$1"
     local verbose="$2"
     local file_errors=()
+
+    # Reset severity counters for this file
+    reset_severity_counts
 
     echo -e "${BLUE}[ПРОВЕРЯЮ]${NC} $file"
 
@@ -4289,6 +6305,48 @@ validate_yaml_file() {
         file_errors+=("$json_errors")
     fi
 
+    # === B17-B20: Additional YAML Semantics Checks (v2.7.0) ===
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка float без ведущего нуля...${NC}"
+    fi
+    local float_warnings
+    float_warnings=$(check_float_leading_zero "$file")
+    if [[ -n "$float_warnings" ]]; then
+        file_errors+=("=== YAML: FLOAT LEADING ZERO ===")
+        file_errors+=("$float_warnings")
+    fi
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка NaN/Infinity...${NC}"
+    fi
+    local special_float_warnings
+    special_float_warnings=$(check_special_floats "$file" "$STRICT_MODE")
+    if [[ -n "$special_float_warnings" ]]; then
+        file_errors+=("=== YAML: SPECIAL FLOATS ===")
+        file_errors+=("$special_float_warnings")
+    fi
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка глубины вложенности...${NC}"
+    fi
+    local nesting_warnings
+    nesting_warnings=$(check_nesting_depth "$file" 10)
+    if [[ -n "$nesting_warnings" ]]; then
+        file_errors+=("=== YAML: NESTING DEPTH ===")
+        file_errors+=("$nesting_warnings")
+    fi
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка Unicode...${NC}"
+    fi
+    local unicode_warnings
+    unicode_warnings=$(check_unicode_normalization "$file")
+    if [[ -n "$unicode_warnings" ]]; then
+        file_errors+=("=== YAML: UNICODE ISSUES ===")
+        file_errors+=("$unicode_warnings")
+    fi
+
     if [[ $verbose -eq 1 ]]; then
         echo -e "  ${CYAN}├─ Проверка network values...${NC}"
     fi
@@ -4299,7 +6357,7 @@ validate_yaml_file() {
     fi
 
     if [[ $verbose -eq 1 ]]; then
-        echo -e "  ${CYAN}└─ Проверка key naming...${NC}"
+        echo -e "  ${CYAN}├─ Проверка key naming...${NC}"
     fi
     local naming_warnings
     naming_warnings=$(check_key_naming "$file")
@@ -4308,18 +6366,349 @@ validate_yaml_file() {
         file_errors+=("$naming_warnings")
     fi
 
+    # === NEW CHECKS v2.6.0 - PSS SECURITY ===
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка PSS Baseline...${NC}"
+    fi
+    local pss_baseline_warnings
+    pss_baseline_warnings=$(check_pss_baseline "$file")
+    if [[ -n "$pss_baseline_warnings" ]]; then
+        file_errors+=("=== БЕЗОПАСНОСТЬ: PSS BASELINE ===")
+        file_errors+=("$pss_baseline_warnings")
+    fi
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка PSS Restricted...${NC}"
+    fi
+    local pss_restricted_warnings
+    pss_restricted_warnings=$(check_pss_restricted "$file")
+    if [[ -n "$pss_restricted_warnings" ]]; then
+        file_errors+=("=== БЕЗОПАСНОСТЬ: PSS RESTRICTED ===")
+        file_errors+=("$pss_restricted_warnings")
+    fi
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка sensitive mounts...${NC}"
+    fi
+    local sensitive_mount_warnings
+    sensitive_mount_warnings=$(check_sensitive_mounts "$file")
+    if [[ -n "$sensitive_mount_warnings" ]]; then
+        file_errors+=("=== БЕЗОПАСНОСТЬ: SENSITIVE MOUNTS ===")
+        file_errors+=("$sensitive_mount_warnings")
+    fi
+
+    # === D20: Writable hostPath (v2.7.0) ===
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка writable hostPath...${NC}"
+    fi
+    local writable_hostpath_warnings
+    writable_hostpath_warnings=$(check_writable_hostpath "$file")
+    if [[ -n "$writable_hostpath_warnings" ]]; then
+        file_errors+=("=== БЕЗОПАСНОСТЬ: WRITABLE HOSTPATH ===")
+        file_errors+=("$writable_hostpath_warnings")
+    fi
+
+    # === D23: drop NET_RAW capability (v2.7.0) ===
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка drop NET_RAW...${NC}"
+    fi
+    local net_raw_warnings
+    net_raw_warnings=$(check_drop_net_raw "$file")
+    if [[ -n "$net_raw_warnings" ]]; then
+        file_errors+=("=== БЕЗОПАСНОСТЬ: DROP NET_RAW ===")
+        file_errors+=("$net_raw_warnings")
+    fi
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка privileged ports...${NC}"
+    fi
+    local priv_port_warnings
+    priv_port_warnings=$(check_privileged_ports "$file")
+    if [[ -n "$priv_port_warnings" ]]; then
+        file_errors+=("=== БЕЗОПАСНОСТЬ: PRIVILEGED PORTS ===")
+        file_errors+=("$priv_port_warnings")
+    fi
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка RBAC security...${NC}"
+    fi
+    local rbac_warnings
+    rbac_warnings=$(check_rbac_security "$file")
+    if [[ -n "$rbac_warnings" ]]; then
+        file_errors+=("=== БЕЗОПАСНОСТЬ: RBAC ===")
+        file_errors+=("$rbac_warnings")
+    fi
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка secrets in env...${NC}"
+    fi
+    local secrets_env_warnings
+    secrets_env_warnings=$(check_secrets_in_env "$file")
+    if [[ -n "$secrets_env_warnings" ]]; then
+        file_errors+=("=== БЕЗОПАСНОСТЬ: SECRETS IN ENV ===")
+        file_errors+=("$secrets_env_warnings")
+    fi
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка default ServiceAccount...${NC}"
+    fi
+    local default_sa_warnings
+    default_sa_warnings=$(check_default_service_account "$file")
+    if [[ -n "$default_sa_warnings" ]]; then
+        file_errors+=("=== БЕЗОПАСНОСТЬ: SERVICE ACCOUNT ===")
+        file_errors+=("$default_sa_warnings")
+    fi
+
+    # === YAMLLINT-COMPATIBLE CHECKS v2.6.0 ===
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка длины строк...${NC}"
+    fi
+    local line_length_warnings
+    line_length_warnings=$(check_line_length "$file" 120)
+    if [[ -n "$line_length_warnings" ]]; then
+        file_errors+=("=== СТИЛЬ: LINE LENGTH ===")
+        file_errors+=("$line_length_warnings")
+    fi
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка формата комментариев...${NC}"
+    fi
+    local comment_warnings
+    comment_warnings=$(check_comment_format "$file")
+    if [[ -n "$comment_warnings" ]]; then
+        file_errors+=("=== СТИЛЬ: COMMENTS ===")
+        file_errors+=("$comment_warnings")
+    fi
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка отступов комментариев...${NC}"
+    fi
+    local comment_indent_warnings
+    comment_indent_warnings=$(check_comment_indentation "$file")
+    if [[ -n "$comment_indent_warnings" ]]; then
+        file_errors+=("=== СТИЛЬ: COMMENT INDENTATION ===")
+        file_errors+=("$comment_indent_warnings")
+    fi
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка пустых строк...${NC}"
+    fi
+    local empty_line_warnings
+    empty_line_warnings=$(check_empty_lines "$file" 2)
+    if [[ -n "$empty_line_warnings" ]]; then
+        file_errors+=("=== СТИЛЬ: EMPTY LINES ===")
+        file_errors+=("$empty_line_warnings")
+    fi
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка newline в конце файла...${NC}"
+    fi
+    local eof_warnings
+    eof_warnings=$(check_newline_at_eof "$file")
+    if [[ -n "$eof_warnings" ]]; then
+        file_errors+=("=== СТИЛЬ: NEWLINE AT EOF ===")
+        file_errors+=("$eof_warnings")
+    fi
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка пробелов у двоеточий...${NC}"
+    fi
+    local colon_warnings
+    colon_warnings=$(check_colons_spacing "$file")
+    if [[ -n "$colon_warnings" ]]; then
+        file_errors+=("=== СТИЛЬ: COLONS SPACING ===")
+        file_errors+=("$colon_warnings")
+    fi
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка пробелов в скобках...${NC}"
+    fi
+    local bracket_warnings
+    bracket_warnings=$(check_brackets_spacing "$file")
+    if [[ -n "$bracket_warnings" ]]; then
+        file_errors+=("=== СТИЛЬ: BRACKETS SPACING ===")
+        file_errors+=("$bracket_warnings")
+    fi
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}└─ Проверка truthy values...${NC}"
+    fi
+    local truthy_warnings
+    truthy_warnings=$(check_truthy_values "$file")
+    if [[ -n "$truthy_warnings" ]]; then
+        file_errors+=("=== YAML: TRUTHY VALUES ===")
+        file_errors+=("$truthy_warnings")
+    fi
+
+    # A18: K8s key ordering (optional)
+    if [[ $CHECK_KEY_ORDERING -eq 1 ]]; then
+        if [[ $verbose -eq 1 ]]; then
+            echo -e "  ${CYAN}├─ Проверка порядка ключей K8s...${NC}"
+        fi
+        local key_order_warnings
+        key_order_warnings=$(check_key_ordering "$file")
+        if [[ -n "$key_order_warnings" ]]; then
+            file_errors+=("=== СТИЛЬ: KEY ORDERING ===")
+            file_errors+=("$key_order_warnings")
+        fi
+    fi
+
+    # C31-C33: Partial schema validation (optional)
+    if [[ $CHECK_PARTIAL_SCHEMA -eq 1 ]]; then
+        if [[ $verbose -eq 1 ]]; then
+            echo -e "  ${CYAN}├─ Проверка типов полей...${NC}"
+        fi
+        local field_type_errors
+        field_type_errors=$(check_field_types "$file")
+        if [[ -n "$field_type_errors" ]]; then
+            file_errors+=("=== СХЕМА: FIELD TYPES ===")
+            file_errors+=("$field_type_errors")
+        fi
+
+        if [[ $verbose -eq 1 ]]; then
+            echo -e "  ${CYAN}├─ Проверка enum значений...${NC}"
+        fi
+        local enum_errors
+        enum_errors=$(check_enum_values "$file")
+        if [[ -n "$enum_errors" ]]; then
+            file_errors+=("=== СХЕМА: ENUM VALUES ===")
+            file_errors+=("$enum_errors")
+        fi
+
+        if [[ $verbose -eq 1 ]]; then
+            echo -e "  ${CYAN}├─ Проверка обязательных вложенных полей...${NC}"
+        fi
+        local required_errors
+        required_errors=$(check_required_nested "$file")
+        if [[ -n "$required_errors" ]]; then
+            file_errors+=("=== СХЕМА: REQUIRED NESTED ===")
+            file_errors+=("$required_errors")
+        fi
+    fi
+
+    # E8-E19: Best practices checks
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка HA (replicas >= 3)...${NC}"
+    fi
+    local ha_warnings
+    ha_warnings=$(check_replicas_ha "$file")
+    if [[ -n "$ha_warnings" ]]; then
+        file_errors+=("=== BEST PRACTICE: HIGH AVAILABILITY ===")
+        file_errors+=("$ha_warnings")
+    fi
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка anti-affinity...${NC}"
+    fi
+    local affinity_warnings
+    affinity_warnings=$(check_anti_affinity "$file")
+    if [[ -n "$affinity_warnings" ]]; then
+        file_errors+=("=== BEST PRACTICE: ANTI-AFFINITY ===")
+        file_errors+=("$affinity_warnings")
+    fi
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка rolling update strategy...${NC}"
+    fi
+    local strategy_warnings
+    strategy_warnings=$(check_rolling_update "$file")
+    if [[ -n "$strategy_warnings" ]]; then
+        file_errors+=("=== BEST PRACTICE: UPDATE STRATEGY ===")
+        file_errors+=("$strategy_warnings")
+    fi
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка дублирующихся env переменных...${NC}"
+    fi
+    local dup_env_warnings
+    dup_env_warnings=$(check_duplicate_env "$file")
+    if [[ -n "$dup_env_warnings" ]]; then
+        file_errors+=("=== BEST PRACTICE: DUPLICATE ENV ===")
+        file_errors+=("$dup_env_warnings")
+    fi
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка namespace...${NC}"
+    fi
+    local ns_warnings
+    ns_warnings=$(check_missing_namespace "$file")
+    if [[ -n "$ns_warnings" ]]; then
+        file_errors+=("=== BEST PRACTICE: NAMESPACE ===")
+        file_errors+=("$ns_warnings")
+    fi
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка priorityClassName...${NC}"
+    fi
+    local priority_warnings
+    priority_warnings=$(check_priority_class "$file")
+    if [[ -n "$priority_warnings" ]]; then
+        file_errors+=("=== BEST PRACTICE: PRIORITY CLASS ===")
+        file_errors+=("$priority_warnings")
+    fi
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка портов в probes...${NC}"
+    fi
+    local probe_port_warnings
+    probe_port_warnings=$(check_probe_ports "$file")
+    if [[ -n "$probe_port_warnings" ]]; then
+        file_errors+=("=== BEST PRACTICE: PROBE PORTS ===")
+        file_errors+=("$probe_port_warnings")
+    fi
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}├─ Проверка ownership labels...${NC}"
+    fi
+    local owner_warnings
+    owner_warnings=$(check_owner_label "$file")
+    if [[ -n "$owner_warnings" ]]; then
+        file_errors+=("=== BEST PRACTICE: OWNERSHIP LABELS ===")
+        file_errors+=("$owner_warnings")
+    fi
+
+    if [[ $verbose -eq 1 ]]; then
+        echo -e "  ${CYAN}└─ Проверка dangling resources...${NC}"
+    fi
+    local dangling_warnings
+    dangling_warnings=$(check_dangling_resources "$file")
+    if [[ -n "$dangling_warnings" ]]; then
+        file_errors+=("=== BEST PRACTICE: DANGLING RESOURCES ===")
+        file_errors+=("$dangling_warnings")
+    fi
+
+    # Add severity counts to totals
+    add_to_totals
+
+    # Build severity summary for this file
+    local severity_summary=""
+    [[ ${SEVERITY_COUNTS[ERROR]} -gt 0 ]] && severity_summary+=" E:${SEVERITY_COUNTS[ERROR]}"
+    [[ ${SEVERITY_COUNTS[WARNING]} -gt 0 ]] && severity_summary+=" W:${SEVERITY_COUNTS[WARNING]}"
+    [[ ${SEVERITY_COUNTS[INFO]} -gt 0 ]] && severity_summary+=" I:${SEVERITY_COUNTS[INFO]}"
+    [[ ${SEVERITY_COUNTS[SECURITY]} -gt 0 ]] && severity_summary+=" S:${SEVERITY_COUNTS[SECURITY]}"
+
     if [[ ${#file_errors[@]} -eq 0 ]]; then
         echo -e "${GREEN}[✓ УСПЕХ]${NC} $file - ошибок не найдено"
         ((PASSED_FILES++))
         return 0
     else
-        echo -e "${RED}[✗ ОШИБКА]${NC} $file - обнаружены проблемы"
-        ((FAILED_FILES++))
+        # Check if this should be a failure based on severity mode
+        if file_has_errors; then
+            echo -e "${RED}[✗ ОШИБКА]${NC} $file - обнаружены проблемы [${severity_summary# }]"
+            ((FAILED_FILES++))
+        else
+            echo -e "${YELLOW}[⚠ ПРЕДУПРЕЖДЕНИЯ]${NC} $file - найдены замечания [${severity_summary# }]"
+            ((PASSED_FILES++))
+        fi
         ERRORS_FOUND+=("" "═══════════════════════════════════════════════════════════════════════")
         ERRORS_FOUND+=("ФАЙЛ: $file")
+        ERRORS_FOUND+=("Severity: [${severity_summary# }] Mode: $SECURITY_MODE $([ $STRICT_MODE -eq 1 ] && echo "+STRICT")")
         ERRORS_FOUND+=("═══════════════════════════════════════════════════════════════════════")
         ERRORS_FOUND+=("${file_errors[@]}")
-        return 1
+
+        file_has_errors && return 1 || return 0
     fi
 }
 
@@ -4399,7 +6788,18 @@ main() {
             -h|--help) usage ;;
             -r|--recursive) recursive=1; shift ;;
             -v|--verbose) verbose=1; shift ;;
+            -s|--strict) STRICT_MODE=1; shift ;;
+            --security-mode)
+                case "$2" in
+                    strict|normal|permissive) SECURITY_MODE="$2" ;;
+                    *) echo "Ошибка: --security-mode должен быть strict|normal|permissive"; exit 1 ;;
+                esac
+                shift 2
+                ;;
             -o|--output) output_file="$2"; shift 2 ;;
+            --key-ordering) CHECK_KEY_ORDERING=1; shift ;;
+            --partial-schema) CHECK_PARTIAL_SCHEMA=1; shift ;;
+            --all-checks) CHECK_KEY_ORDERING=1; CHECK_PARTIAL_SCHEMA=1; shift ;;
             -*) echo "Неизвестная опция: $1"; usage ;;
             *) target_dir="$1"; shift ;;
         esac
@@ -4427,6 +6827,7 @@ main() {
     else
         echo -e "Директория: ${CYAN}$target_dir${NC}"
         echo -e "Режим: ${CYAN}$([ $recursive -eq 1 ] && echo "Рекурсивный" || echo "Только текущая директория")${NC}"
+        echo -e "Безопасность: ${CYAN}$SECURITY_MODE${NC}$([ $STRICT_MODE -eq 1 ] && echo " + ${YELLOW}STRICT${NC}")"
         echo ""
         echo -e "${YELLOW}[ПОИСК]${NC} Сканирование файлов..."
         mapfile -t yaml_files < <(find_yaml_files "$target_dir" "$recursive")
