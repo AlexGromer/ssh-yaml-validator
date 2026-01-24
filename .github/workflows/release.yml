@@ -31,18 +31,14 @@ jobs:
 
           echo "Tag version: $TAG_VERSION"
           echo "Validator version: $VALIDATOR_VERSION"
-          echo "Fix module version: $FIX_VERSION"
+          echo "Fix module version: $FIX_VERSION (independent versioning)"
 
           if [ "$VALIDATOR_VERSION" != "$TAG_VERSION" ]; then
             echo "❌ Version mismatch in yaml_validator.sh"
             exit 1
           fi
 
-          if [ "$FIX_VERSION" != "$TAG_VERSION" ]; then
-            echo "❌ Version mismatch in fix_yaml_issues.sh"
-            exit 1
-          fi
-
+          # Note: fix_yaml_issues.sh has independent versioning (v3.0.0+)
           echo "✅ Version consistency verified"
 
       - name: Create release archive
