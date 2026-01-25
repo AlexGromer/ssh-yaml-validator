@@ -1,6 +1,6 @@
 # YAML Validator для изолированных контуров
 
-**Version: 2.8.0** | Pure Bash | Zero Dependencies | **Coverage: 99.4%**
+**Version: 2.9.0** | Pure Bash | Zero Dependencies | **Coverage: 99.7%**
 
 Валидатор YAML файлов для закрытых сред без доступа к интернету и возможности установки дополнительных утилит.
 
@@ -10,12 +10,15 @@
 
 ## Ключевые особенности
 
-- **124 проверки** в 5 категориях (YAML Syntax, Semantics, K8s Base, Security, Best Practices)
+- **134 проверки** в 5 категориях (YAML Syntax, Semantics, K8s Base, Security, Best Practices)
 - **Система severity levels** — ERROR, WARNING, INFO, SECURITY
 - **Режимы безопасности** — strict, normal, permissive
-- **Чистый Bash** — никаких внешних зависимостей
+- **Чистый Bash** — никаких внешних зависимостей (100% POSIX-совместимый)
+- **Graceful degradation** — опциональные утилиты (jq, yq, yamllint) расширяют функционал
+- **3 режима работы** — автономный, joint mode (--fix), JSON integration
 - **Детальный вывод** — указывает номера строк и как исправить
 - **Автоматическое исправление** — 13 типов ошибок + интерактивный режим
+- **Verbose/Quiet режимы** — от подробного до минимального вывода
 - **Поддержка Deckhouse CRD** — валидация enum-значений
 - **yamllint-совместимость** — проверки аналогичные yamllint
 
@@ -44,7 +47,10 @@ chmod +x yaml_validator.sh fix_yaml_issues.sh
 # Все проверки включая опциональные
 ./yaml_validator.sh --all-checks /path/to/manifests
 
-# Автоматическое исправление
+# Валидация + автоисправление (joint mode)
+./yaml_validator.sh --fix config.yaml
+
+# Автоматическое исправление (автономный режим)
 ./fix_yaml_issues.sh config.yaml
 
 # Интерактивный режим (для security fixes)
@@ -57,14 +63,14 @@ chmod +x yaml_validator.sh fix_yaml_issues.sh
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                         YAML VALIDATOR WORKFLOW v2.8.0                       │
+│                         YAML VALIDATOR WORKFLOW v2.9.0                       │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                              │
 │   ┌──────────────────┐     ┌──────────────────┐     ┌──────────────────┐    │
 │   │  yaml_validator  │     │   fix_yaml_      │     │   Validation     │    │
 │   │      .sh         │     │    issues.sh     │     │    Report        │    │
 │   │                  │     │     v3.0.0       │     │     (.txt)       │    │
-│   │  • 124 проверки  │     │  • 13 авто-      │     │  • Статистика    │    │
+│   │  • 134 проверки  │     │  • 13 авто-      │     │  • Статистика    │    │
 │   │  • Severity      │────▶│    исправлений   │────▶│  • Ошибки        │    │
 │   │  • Security mode │     │  • Interactive   │     │  • Рекомендации  │    │
 │   │                  │     │  • Dry-run       │     │                  │    │
@@ -105,7 +111,7 @@ chmod +x yaml_validator.sh fix_yaml_issues.sh
 
 ---
 
-## Полный список проверок (124 шт.)
+## Полный список проверок (134 шт.)
 
 ### A. YAML Syntax (22 проверки) — 100%
 
@@ -207,7 +213,7 @@ chmod +x yaml_validator.sh fix_yaml_issues.sh
 | D27 | `check_default_service_account` | kube-linter | Default service account |
 | D28-30 | `check_rbac_security` | CIS | cluster-admin, wildcards, secrets |
 
-### E. Kubernetes Best Practices (20 проверок) — 100%
+### E. Kubernetes Best Practices (30 проверок) — 100%
 
 | # | Проверка | Описание |
 |---|----------|----------|
@@ -223,7 +229,16 @@ chmod +x yaml_validator.sh fix_yaml_issues.sh
 | E17 | `check_priority_class` | Priority class not set |
 | E18 | `check_probe_ports` | Probe ports validation |
 | E19 | `check_owner_label` | Missing owner label |
-| E20 | `check_deckhouse_crd` | Deckhouse CRD validation |
+| E20 | `check_missing_limits` | Missing resource limits/requests |
+| E21 | `check_pvc_validation` | PVC validation (accessModes, storage format) |
+| E22 | `check_resource_quota` | ResourceQuota validation |
+| E23 | `check_limit_range` | LimitRange type validation |
+| E24 | `check_termination_grace` | terminationGracePeriodSeconds (0 or >600s) |
+| E25 | `check_topology_spread` | TopologySpreadConstraints validation |
+| E27 | `check_statefulset_volumes` | StatefulSet without volumeClaimTemplates |
+| E28 | `check_init_containers` | initContainers with probes |
+| E29 | `check_cronjob_concurrency` | CronJob concurrencyPolicy validation |
+| E30 | `check_deckhouse_crd` | Deckhouse CRD validation |
 
 ---
 
@@ -268,6 +283,59 @@ chmod +x yaml_validator.sh fix_yaml_issues.sh
 
 ---
 
+## Режимы работы
+
+### 1. Автономный режим (Autonomous Mode)
+
+Фиксатор работает независимо, сканирует все fixable issues:
+
+```bash
+./fix_yaml_issues.sh config.yaml
+```
+
+**Возможности:**
+- Автоматическое обнаружение всех 13 типов проблем
+- Не требует предварительного запуска validator
+- Поддержка всех опций (-b, -n, -i, -r, -v, -q)
+
+### 2. Joint Mode (Validator + Fixer)
+
+Validator автоматически запускает фиксатор после проверки:
+
+```bash
+./yaml_validator.sh --fix config.yaml
+```
+
+**Workflow:**
+1. Validator проверяет файл
+2. Генерирует JSON отчёт с fixable issues
+3. Автоматически запускает fixer с этим отчётом
+4. Fixer исправляет только проблемы из отчёта
+
+**Преимущества:**
+- Одна команда для валидации + исправления
+- Фиксатор работает только с проблемами из отчёта
+- Безопасное исправление (только известные проблемы)
+
+### 3. JSON Integration Mode
+
+Ручная интеграция через JSON отчёт:
+
+```bash
+# Шаг 1: Генерация JSON отчёта
+./yaml_validator.sh --json config.yaml > report.json
+
+# Шаг 2: Исправление на основе отчёта
+./fix_yaml_issues.sh --report report.json config.yaml
+```
+
+**Использование:**
+- CI/CD пайплайны
+- Кастомная обработка результатов
+- Интеграция с другими инструментами
+
+---
+
 ## Опции командной строки
 
 ### yaml_validator.sh
@@ -279,16 +347,24 @@ chmod +x yaml_validator.sh fix_yaml_issues.sh
     -o, --output FILE       Сохранить отчёт в файл
     -r, --recursive         Рекурсивный поиск YAML файлов
     -v, --verbose           Подробный вывод
+    -q, --quiet             Тихий режим (только exit code)
     -h, --help              Показать справку
 
 Severity контроль:
     -s, --strict            Строгий режим: WARNING → ERROR
     --security-mode MODE    strict|normal|permissive
 
+Автоисправление (Joint Mode):
+    --fix                   Автоматически запустить фиксатор после валидации
+    --fixer-path PATH       Путь к fix_yaml_issues.sh (по умолчанию: ./fix_yaml_issues.sh)
+
 Опциональные проверки:
     --key-ordering          Проверка порядка ключей K8s
     --partial-schema        Частичная валидация схемы
     --all-checks            Включить все опциональные проверки
+
+Форматы вывода:
+    --json                  Вывод в JSON формате (для интеграции с fixer)
 ```
 
 ### fix_yaml_issues.sh
@@ -301,6 +377,8 @@ Severity контроль:
     -b, --backup            Создать backup (.bak)
     -n, --dry-run           Только показать изменения
     -i, --interactive       Интерактивный режим (подтверждение)
+    -v, --verbose           Подробный вывод
+    -q, --quiet             Тихий режим (только exit code)
     -h, --help              Показать справку
 ```
 
@@ -317,13 +395,54 @@ Severity контроль:
 
 ## Требования
 
+### Обязательные
+
 - **ОС**: Astra Linux SE 1.7 (Smolensk), любой Linux, macOS
 - **Bash**: 4.0+
-- **Зависимости**: ТОЛЬКО стандартные утилиты (grep, sed, awk, od, head)
+- **Стандартные утилиты**: grep, sed, awk, od, head, tail, cat, tr, wc
+
+### Опциональные (Graceful Degradation)
+
+Если установлены, расширяют возможности:
+
+| Утилита | Функционал | Fallback |
+|---------|------------|----------|
+| `jq` | JSON processing для --json режима | Работает без JSON вывода |
+| `yq` | Расширенная YAML валидация | Pure bash парсер |
+| `yamllint` | Дополнительная проверка стиля | Встроенные проверки |
+| `dos2unix` | CRLF конвертация | sed fallback |
+
+**Важно:** Все утилиты опциональны. Скрипт работает в air-gapped окружении без них.
 
 ---
 
 ## Changelog
+
+### v2.9.0 (2026-01-25)
+- **Coverage: 99.7%** (+0.3%)
+- **Новые проверки (E20-E29)** — 10 edge cases для K8s ресурсов:
+  - E20: Missing resource limits/requests validation
+  - E21: PVC validation (accessModes, storage format, volumeMode)
+  - E22: ResourceQuota validation (hard limits, resource types)
+  - E23: LimitRange type validation (Container/Pod/PVC)
+  - E24: terminationGracePeriodSeconds (0 or >600s warnings)
+  - E25: TopologySpreadConstraints validation (maxSkew, whenUnsatisfiable)
+  - E27: StatefulSet without volumeClaimTemplates
+  - E28: initContainers with probes detection (ERROR)
+  - E29: CronJob concurrencyPolicy validation
+- **Новые возможности:**
+  - Joint mode: `--fix` для автоматического исправления после валидации
+  - Quiet mode: `-q/--quiet` для минимального вывода (только exit code)
+  - Verbose mode для fixer: `-v` для подробного вывода исправлений
+  - JSON integration: улучшена интеграция validator → fixer
+- **Исправлено 6 багов:**
+  - AWK empty lines pattern (END block override fix)
+  - Fix ordering: colon_spacing before booleans ("key:True" → "key: true")
+  - Document separator reset (PVC/Quota/LimitRange state cleanup)
+  - Return code handling (WARNING-only output поддержка)
+  - Regex fixes (LimitRange list items, initContainers probe detection)
+  - Version display update (2.8.0 → 2.9.0)
+- **Total:** 134 checks, 101 validation functions (было 91)
 
 ### v2.8.0 (2026-01-24)
 - **Coverage: 99.4%** (+11.25%)

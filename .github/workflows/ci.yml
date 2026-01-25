@@ -109,7 +109,7 @@ jobs:
         uses: ludeeus/action-shellcheck@master
         with:
           scandir: '.'
-          severity: warning
+          severity: error
           ignore_paths: 'test_samples test_samples_fix'
 
   security:
