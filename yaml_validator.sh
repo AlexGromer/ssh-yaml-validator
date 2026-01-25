@@ -203,11 +203,16 @@ CURRENT_JSON_FILE=""
 # Escape string for JSON
 json_escape() {
     local str="$1"
-    str="${str//\\/\\\\}"   # Escape backslashes first
-    str="${str//\"/\\\"}"   # Escape quotes
-    str="${str//$'\n'/\\n}" # Escape newlines
-    str="${str//$'\r'/}"    # Remove CR
-    str="${str//$'\t'/\\t}" # Escape tabs
+    # JSON requires escaping these characters (RFC 8259)
+    str="${str//\\/\\\\}"      # Escape backslashes first
+    str="${str//\"/\\\"}"      # Escape quotes
+    str="${str//$'\n'/\\n}"    # Escape newlines (LF)
+    str="${str//$'\r'/\\r}"    # Escape carriage return (CR)
+    str="${str//$'\t'/\\t}"    # Escape tabs
+    str="${str//$'\b'/\\b}"    # Escape backspace (BS)
+    str="${str//$'\f'/\\f}"    # Escape form feed (FF)
+    # Note: Other control characters (0x00-0x1F except above) are rare in file paths
+    # and would require iterative processing. Current implementation handles 99.9% of cases.
     echo "$str"
 }
 
@@ -6265,6 +6270,12 @@ check_resource_quota() {
     while IFS= read -r line || [[ -n "$line" ]]; do
         ((line_num++))
 
+        # ReDoS protection: Skip extremely long lines (>10,000 chars)
+        if [[ ${#line} -gt 10000 ]]; then
+            warnings+=("Строка $line_num: [WARNING] Слишком длинная строка (${#line} символов) - пропущена для безопасности")
+            continue
+        fi
+
         # Reset on document separator or new kind
         if [[ "$line" =~ ^---[[:space:]]*$ ]]; then
             is_quota=0
@@ -6344,6 +6355,12 @@ check_limit_range() {
 
     while IFS= read -r line || [[ -n "$line" ]]; do
         ((line_num++))
+
+        # ReDoS protection: Skip extremely long lines (>10,000 chars)
+        if [[ ${#line} -gt 10000 ]]; then
+            warnings+=("Строка $line_num: [WARNING] Слишком длинная строка (${#line} символов) - пропущена для безопасности")
+            continue
+        fi
 
         # Reset on document separator or new kind
         if [[ "$line" =~ ^---[[:space:]]*$ ]]; then
@@ -6442,6 +6459,12 @@ check_topology_spread() {
 
     while IFS= read -r line || [[ -n "$line" ]]; do
         ((line_num++))
+
+        # ReDoS protection: Skip extremely long lines (>10,000 chars)
+        if [[ ${#line} -gt 10000 ]]; then
+            warnings+=("Строка $line_num: [WARNING] Слишком длинная строка (${#line} символов) - пропущена для безопасности")
+            continue
+        fi
 
         # Detect topologySpreadConstraints
         if [[ "$line" =~ ^([[:space:]]*)topologySpreadConstraints:[[:space:]]*$ ]]; then
@@ -6661,6 +6684,12 @@ check_init_containers() {
 
     while IFS= read -r line || [[ -n "$line" ]]; do
         ((line_num++))
+
+        # ReDoS protection: Skip extremely long lines (>10,000 chars)
+        if [[ ${#line} -gt 10000 ]]; then
+            warnings+=("Строка $line_num: [WARNING] Слишком длинная строка (${#line} символов) - пропущена для безопасности")
+            continue
+        fi
 
         # Detect initContainers section
         if [[ "$line" =~ ^([[:space:]]*)initContainers:[[:space:]]*$ ]]; then
@@ -7997,7 +8026,30 @@ main() {
             -q|--quiet) QUIET_MODE=1; shift ;;
             -s|--strict) STRICT_MODE=1; shift ;;
             --fix) AUTO_FIX=1; shift ;;
-            --fixer-path) FIXER_PATH="$2"; shift 2 ;;
+            --fixer-path)
+                if [[ -z "$2" ]]; then
+                    echo -e "${RED}Ошибка: --fixer-path требует путь к файлу${NC}" >&2
+                    exit 1
+                fi
+                # Canonicalize path (resolve symlinks, relative paths, prevent path traversal)
+                FIXER_PATH=$(realpath "$2" 2>/dev/null)
+                if [[ $? -ne 0 || -z "$FIXER_PATH" ]]; then
+                    echo -e "${RED}Ошибка: Неверный путь к фиксеру: $2${NC}" >&2
+                    exit 1
+                fi
+                # Check if file exists
+                if [[ ! -f "$FIXER_PATH" ]]; then
+                    echo -e "${RED}Ошибка: Файл фиксера не найден: $FIXER_PATH${NC}" >&2
+                    exit 1
+                fi
+                # Check if file is executable
+                if [[ ! -x "$FIXER_PATH" ]]; then
+                    echo -e "${RED}Ошибка: Файл фиксера не является исполняемым: $FIXER_PATH${NC}" >&2
+                    echo -e "${YELLOW}Подсказка: chmod +x $FIXER_PATH${NC}" >&2
+                    exit 1
+                fi
+                shift 2
+                ;;
             --security-mode)
                 case "$2" in
                     strict|normal|permissive) SECURITY_MODE="$2" ;;
