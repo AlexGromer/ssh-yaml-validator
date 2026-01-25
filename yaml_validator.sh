@@ -5,8 +5,8 @@
 # Pure bash implementation for Astra Linux SE 1.7 (Smolensk)
 # Purpose: Validate YAML files in Kubernetes clusters without external tools
 # Author: Generated for isolated environments
-# Version: 2.8.0
-# Updated: 2026-01-24
+# Version: 2.9.0
+# Updated: 2026-01-25
 #############################################################################
 
 set -o pipefail
@@ -66,6 +66,30 @@ CHECK_PARTIAL_SCHEMA=0    # C31-33: Partial type/enum validation
 # JSON output mode
 JSON_OUTPUT=0
 declare -a JSON_FILES=()   # Array to store JSON file objects
+
+# Optional tools detection (detected once at startup)
+declare -A OPTIONAL_TOOLS
+OPTIONAL_TOOLS[jq]=0
+OPTIONAL_TOOLS[yq]=0
+OPTIONAL_TOOLS[yamllint]=0
+OPTIONAL_TOOLS[shyaml]=0
+OPTIONAL_TOOLS[dos2unix]=0
+
+# Detect optional tools at startup
+detect_optional_tools() {
+    command -v jq &>/dev/null && OPTIONAL_TOOLS[jq]=1
+    command -v yq &>/dev/null && OPTIONAL_TOOLS[yq]=1
+    command -v yamllint &>/dev/null && OPTIONAL_TOOLS[yamllint]=1
+    command -v shyaml &>/dev/null && OPTIONAL_TOOLS[shyaml]=1
+    command -v dos2unix &>/dev/null && OPTIONAL_TOOLS[dos2unix]=1
+}
+
+# Quiet mode: minimal output, exit code only
+QUIET_MODE=0
+
+# Auto-fix mode: run fixer after validation
+AUTO_FIX=0
+FIXER_PATH="./fix_yaml_issues.sh"
 
 # Reset severity counters for a new file
 reset_severity_counts() {
@@ -162,7 +186,7 @@ file_has_errors() {
 print_header() {
     echo -e "${BOLD}${CYAN}"
     echo "╔═══════════════════════════════════════════════════════════════════════╗"
-    echo "║                    YAML Validator v2.8.0                              ║"
+    echo "║                    YAML Validator v2.9.0                              ║"
     echo "║              Pure Bash Implementation for Air-Gapped Env              ║"
     echo "╚═══════════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
@@ -310,8 +334,11 @@ usage() {
 Опции:
     -o, --output FILE       Сохранить отчёт в файл (по умолчанию: yaml_validation_report.txt)
     -r, --recursive         Рекурсивный поиск YAML файлов (только для директорий)
-    -v, --verbose           Подробный вывод
+    -v, --verbose           Подробный вывод (показывать каждую проверку)
+    -q, --quiet             Тихий режим (только exit code, минимум вывода)
     -s, --strict            Строгий режим: WARNING и SECURITY → ERROR
+    --fix                   Автоматически запустить фиксатор после валидации
+    --fixer-path PATH       Путь к fix_yaml_issues.sh (по умолчанию: ./fix_yaml_issues.sh)
     --security-mode MODE    Режим безопасности: strict | normal | permissive
                             strict    - SECURITY → ERROR (production)
                             normal    - SECURITY → WARNING (default)
@@ -328,6 +355,12 @@ usage() {
     INFO      Стиль/информация, никогда не ошибка
     SECURITY  Проблема безопасности, зависит от --security-mode
 
+Опциональные утилиты (расширенные возможности):
+    jq        - JSON processing для --json режима
+    yq        - Расширенная YAML валидация
+    yamllint  - Дополнительная проверка стиля
+    dos2unix  - CRLF конвертация (fallback: sed)
+
 Примеры:
     $0 /path/to/manifests
     $0 config.yaml
@@ -335,6 +368,8 @@ usage() {
     $0 --strict /home/user/k8s/                      # Строгий режим
     $0 --security-mode permissive test-manifests/    # Тестовый кластер
     $0 --security-mode strict production-manifests/  # Продакшн
+    $0 --fix --recursive manifests/                  # Валидация + автоисправление
+    $0 --quiet config.yaml && echo "OK"              # Для скриптов
 
 EOF
     exit 0
@@ -5313,6 +5348,54 @@ check_brackets_spacing() {
     return 0
 }
 
+check_boolean_case() {
+    local file="$1"
+    local line_num=0
+    local warnings=()
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Skip comments
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+
+        # Check for True/False/TRUE/FALSE (incorrect case for YAML booleans)
+        if [[ "$line" =~ :[[:space:]]+(True|False|TRUE|FALSE)[[:space:]]*$ ]]; then
+            warnings+=("Строка $line_num: Неправильный регистр boolean значения")
+            warnings+=("  Содержимое: $line")
+            warnings+=("  Рекомендация: Используйте 'true' или 'false' (lowercase)")
+        fi
+    done < "$file"
+
+    if [[ ${#warnings[@]} -gt 0 ]]; then
+        printf '%s\n' "${warnings[@]}"
+    fi
+    return 0
+}
+
+check_list_spacing() {
+    local file="$1"
+    local line_num=0
+    local warnings=()
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Check for list items without space after dash (-item instead of - item)
+        # Skip lines with multiple dashes (---, comments with -, URLs, etc.)
+        if [[ "$line" =~ ^[[:space:]]*-[^[:space:]-] ]] && [[ ! "$line" =~ ^[[:space:]]*---  ]] && [[ ! "$line" =~ ^[[:space:]]*# ]]; then
+            warnings+=("Строка $line_num: Отсутствует пробел после дефиса в элементе списка")
+            warnings+=("  Содержимое: $line")
+            warnings+=("  Рекомендация: Используйте '- item' вместо '-item'")
+        fi
+    done < "$file"
+
+    if [[ ${#warnings[@]} -gt 0 ]]; then
+        printf '%s\n' "${warnings[@]}"
+    fi
+    return 0
+}
+
 check_truthy_values() {
     local file="$1"
     local line_num=0
@@ -5939,6 +6022,750 @@ check_dangling_resources() {
     return 0
 }
 
+# =============================================================================
+# E20: Missing resource limits (v2.9.0)
+# =============================================================================
+check_missing_limits() {
+    local file="$1"
+    local warnings=()
+    local line_num=0
+    local in_container=0
+    local in_init_container=0
+    local container_name=""
+    local has_limits=0
+    local has_requests=0
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Detect containers section
+        if [[ "$line" =~ ^[[:space:]]*containers:[[:space:]]*$ ]]; then
+            in_container=1
+            in_init_container=0
+            continue
+        fi
+
+        # Detect initContainers section
+        if [[ "$line" =~ ^[[:space:]]*initContainers:[[:space:]]*$ ]]; then
+            in_init_container=1
+            in_container=0
+            continue
+        fi
+
+        # Exit containers section
+        if [[ "$line" =~ ^[[:space:]]*[a-zA-Z]+:[[:space:]]* ]] && [[ ! "$line" =~ ^[[:space:]]*- ]]; then
+            # Report previous container if no limits
+            if [[ -n "$container_name" && $has_limits -eq 0 ]]; then
+                if [[ $in_init_container -eq 1 ]]; then
+                    warnings+=("[WARNING] initContainer '$container_name': отсутствуют resource.limits")
+                else
+                    warnings+=("[WARNING] Container '$container_name': отсутствуют resource.limits")
+                fi
+                warnings+=("  Риск: может потребить все ресурсы ноды")
+                warnings+=("  Рекомендация: Добавьте resources.limits.cpu и resources.limits.memory")
+            fi
+            if [[ -n "$container_name" && $has_requests -eq 0 ]]; then
+                if [[ $in_init_container -eq 1 ]]; then
+                    warnings+=("[INFO] initContainer '$container_name': отсутствуют resource.requests")
+                else
+                    warnings+=("[INFO] Container '$container_name': отсутствуют resource.requests")
+                fi
+                warnings+=("  Рекомендация: Добавьте resources.requests для правильного scheduling")
+            fi
+            in_container=0
+            in_init_container=0
+            container_name=""
+            has_limits=0
+            has_requests=0
+        fi
+
+        # Detect container name
+        if [[ ($in_container -eq 1 || $in_init_container -eq 1) && "$line" =~ ^[[:space:]]*-[[:space:]]+name:[[:space:]]+([^[:space:]#]+) ]]; then
+            # Report previous container if no limits
+            if [[ -n "$container_name" && $has_limits -eq 0 ]]; then
+                if [[ $in_init_container -eq 1 ]]; then
+                    warnings+=("[WARNING] initContainer '$container_name': отсутствуют resource.limits")
+                else
+                    warnings+=("[WARNING] Container '$container_name': отсутствуют resource.limits")
+                fi
+                warnings+=("  Риск: может потребить все ресурсы ноды")
+                warnings+=("  Рекомендация: Добавьте resources.limits.cpu и resources.limits.memory")
+            fi
+            if [[ -n "$container_name" && $has_requests -eq 0 ]]; then
+                if [[ $in_init_container -eq 1 ]]; then
+                    warnings+=("[INFO] initContainer '$container_name': отсутствуют resource.requests")
+                else
+                    warnings+=("[INFO] Container '$container_name': отсутствуют resource.requests")
+                fi
+                warnings+=("  Рекомендация: Добавьте resources.requests для правильного scheduling")
+            fi
+
+            container_name="${BASH_REMATCH[1]}"
+            has_limits=0
+            has_requests=0
+        fi
+
+        # Detect limits
+        if [[ ($in_container -eq 1 || $in_init_container -eq 1) && "$line" =~ ^[[:space:]]+limits:[[:space:]]*$ ]]; then
+            has_limits=1
+        fi
+
+        # Detect requests
+        if [[ ($in_container -eq 1 || $in_init_container -eq 1) && "$line" =~ ^[[:space:]]+requests:[[:space:]]*$ ]]; then
+            has_requests=1
+        fi
+    done < "$file"
+
+    # Report last container if no limits
+    if [[ -n "$container_name" && $has_limits -eq 0 ]]; then
+        if [[ $in_init_container -eq 1 ]]; then
+            warnings+=("[WARNING] initContainer '$container_name': отсутствуют resource.limits")
+        else
+            warnings+=("[WARNING] Container '$container_name': отсутствуют resource.limits")
+        fi
+        warnings+=("  Риск: может потребить все ресурсы ноды")
+        warnings+=("  Рекомендация: Добавьте resources.limits.cpu и resources.limits.memory")
+    fi
+    if [[ -n "$container_name" && $has_requests -eq 0 ]]; then
+        if [[ $in_init_container -eq 1 ]]; then
+            warnings+=("[INFO] initContainer '$container_name': отсутствуют resource.requests")
+        else
+            warnings+=("[INFO] Container '$container_name': отсутствуют resource.requests")
+        fi
+        warnings+=("  Рекомендация: Добавьте resources.requests для правильного scheduling")
+    fi
+
+    if [[ ${#warnings[@]} -gt 0 ]]; then
+        printf '%s\n' "${warnings[@]}"
+    fi
+    return 0
+}
+
+# =============================================================================
+# E21: PersistentVolumeClaim validation (v2.9.0)
+# =============================================================================
+check_pvc_validation() {
+    local file="$1"
+    local errors=()
+    local warnings=()
+    local line_num=0
+    local is_pvc=0
+    local has_access_modes=0
+    local has_storage=0
+    local access_mode=""
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Reset on document separator or new kind
+        if [[ "$line" =~ ^---[[:space:]]*$ ]]; then
+            is_pvc=0
+            has_access_modes=0
+            has_storage=0
+            access_mode=""
+            continue
+        fi
+
+        # Detect PVC kind
+        if [[ "$line" =~ ^kind:[[:space:]]*PersistentVolumeClaim ]]; then
+            is_pvc=1
+        elif [[ "$line" =~ ^kind:[[:space:]]* ]]; then
+            # Different kind - reset PVC tracking
+            is_pvc=0
+            has_access_modes=0
+            has_storage=0
+            access_mode=""
+        fi
+
+        [[ $is_pvc -eq 0 ]] && continue
+
+        # Check accessModes
+        if [[ "$line" =~ ^[[:space:]]*accessModes:[[:space:]]*$ ]]; then
+            has_access_modes=1
+        fi
+
+        # Validate accessMode values
+        if [[ "$line" =~ ^[[:space:]]*-[[:space:]]+(ReadWriteOnce|ReadOnlyMany|ReadWriteMany|ReadWriteOncePod)[[:space:]]*$ ]]; then
+            access_mode="${BASH_REMATCH[1]}"
+        elif [[ $has_access_modes -eq 1 && "$line" =~ ^[[:space:]]*-[[:space:]]+([^[:space:]#]+) ]]; then
+            local invalid_mode="${BASH_REMATCH[1]}"
+            errors+=("Строка $line_num: [ERROR] Недопустимый accessMode: '$invalid_mode'")
+            errors+=("  Допустимо: ReadWriteOnce, ReadOnlyMany, ReadWriteMany, ReadWriteOncePod (K8s 1.22+)")
+        fi
+
+        # Check storage size
+        if [[ "$line" =~ ^[[:space:]]+storage:[[:space:]]+([^[:space:]#]+) ]]; then
+            has_storage=1
+            local storage="${BASH_REMATCH[1]}"
+            # Validate storage format (e.g., 1Gi, 500Mi)
+            if [[ ! "$storage" =~ ^[0-9]+[KMGTPE]i?$ ]]; then
+                errors+=("Строка $line_num: [ERROR] Неверный формат storage: '$storage'")
+                errors+=("  Используйте формат: 1Gi, 500Mi, 2Ti")
+            fi
+        fi
+
+        # Check storageClassName
+        if [[ "$line" =~ ^[[:space:]]+storageClassName:[[:space:]]+([^[:space:]#]+) ]]; then
+            local sc_name="${BASH_REMATCH[1]}"
+            # Warn about common typos
+            if [[ "$sc_name" =~ (standart|defaut|defualt) ]]; then
+                warnings+=("Строка $line_num: [WARNING] Возможная опечатка в storageClassName: '$sc_name'")
+                warnings+=("  Проверьте: standard, default")
+            fi
+        fi
+
+        # Check volumeMode
+        if [[ "$line" =~ ^[[:space:]]+volumeMode:[[:space:]]+([^[:space:]#]+) ]]; then
+            local vol_mode="${BASH_REMATCH[1]}"
+            if [[ ! "$vol_mode" =~ ^(Filesystem|Block)$ ]]; then
+                errors+=("Строка $line_num: [ERROR] Недопустимый volumeMode: '$vol_mode'")
+                errors+=("  Допустимо: Filesystem, Block")
+            fi
+        fi
+    done < "$file"
+
+    if [[ $is_pvc -eq 1 ]]; then
+        if [[ $has_access_modes -eq 0 ]]; then
+            errors+=("[ERROR] PVC без accessModes — обязательное поле")
+        fi
+        if [[ $has_storage -eq 0 ]]; then
+            errors+=("[ERROR] PVC без storage в resources.requests — обязательное поле")
+        fi
+
+        # Warning about ReadWriteMany
+        if [[ "$access_mode" == "ReadWriteMany" ]]; then
+            warnings+=("[WARNING] accessMode 'ReadWriteMany' требует поддержки StorageClass")
+            warnings+=("  Не все StorageClass поддерживают RWX (например, AWS EBS не поддерживает)")
+            warnings+=("  Проверьте совместимость с вашим Storage Provider")
+        fi
+    fi
+
+    if [[ ${#errors[@]} -gt 0 ]]; then
+        printf '%s\n' "${errors[@]}"
+        return 1
+    fi
+
+    if [[ ${#warnings[@]} -gt 0 ]]; then
+        printf '%s\n' "${warnings[@]}"
+    fi
+    return 0
+}
+
+# =============================================================================
+# E22: ResourceQuota validation (v2.9.0)
+# =============================================================================
+check_resource_quota() {
+    local file="$1"
+    local errors=()
+    local warnings=()
+    local line_num=0
+    local is_quota=0
+    local has_hard=0
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Reset on document separator or new kind
+        if [[ "$line" =~ ^---[[:space:]]*$ ]]; then
+            is_quota=0
+            has_hard=0
+            continue
+        fi
+
+        # Detect ResourceQuota kind
+        if [[ "$line" =~ ^kind:[[:space:]]*ResourceQuota ]]; then
+            is_quota=1
+        elif [[ "$line" =~ ^kind:[[:space:]]* ]]; then
+            # Different kind - reset quota tracking
+            is_quota=0
+            has_hard=0
+        fi
+
+        [[ $is_quota -eq 0 ]] && continue
+
+        # Check hard section
+        if [[ "$line" =~ ^[[:space:]]*hard:[[:space:]]*$ ]]; then
+            has_hard=1
+        fi
+
+        # Validate quota resource names
+        if [[ $has_hard -eq 1 && "$line" =~ ^[[:space:]]+([a-zA-Z./-]+):[[:space:]]+([^[:space:]#]+) ]]; then
+            local resource="${BASH_REMATCH[1]}"
+            local value="${BASH_REMATCH[2]}"
+
+            # Valid quota resources
+            local valid_resources="requests.cpu|requests.memory|limits.cpu|limits.memory|"
+            valid_resources+="requests.storage|persistentvolumeclaims|"
+            valid_resources+="pods|services|replicationcontrollers|secrets|configmaps|"
+            valid_resources+="requests.nvidia.com/gpu|"
+            valid_resources+="count/deployments.apps|count/statefulsets.apps|count/jobs.batch"
+
+            if [[ ! "$resource" =~ ^($valid_resources) ]]; then
+                warnings+=("Строка $line_num: [WARNING] Нестандартный resource в quota: '$resource'")
+                warnings+=("  Проверьте правильность написания")
+            fi
+
+            # Validate value format for memory/cpu/storage
+            if [[ "$resource" =~ (memory|storage) && ! "$value" =~ ^[0-9]+[KMGTPE]i?$ ]]; then
+                errors+=("Строка $line_num: [ERROR] Неверный формат для $resource: '$value'")
+                errors+=("  Используйте: 1Gi, 500Mi, 2Ti")
+            elif [[ "$resource" =~ cpu && ! "$value" =~ ^[0-9]+m?$ ]]; then
+                errors+=("Строка $line_num: [ERROR] Неверный формат для $resource: '$value'")
+                errors+=("  Используйте: 1, 500m, 2000m")
+            fi
+        fi
+    done < "$file"
+
+    if [[ $is_quota -eq 1 && $has_hard -eq 0 ]]; then
+        errors+=("[ERROR] ResourceQuota без spec.hard — обязательное поле")
+    fi
+
+    if [[ ${#errors[@]} -gt 0 ]]; then
+        printf '%s\n' "${errors[@]}"
+        return 1
+    fi
+
+    if [[ ${#warnings[@]} -gt 0 ]]; then
+        printf '%s\n' "${warnings[@]}"
+    fi
+    return 0
+}
+
+# =============================================================================
+# E23: LimitRange validation (v2.9.0)
+# =============================================================================
+check_limit_range() {
+    local file="$1"
+    local errors=()
+    local warnings=()
+    local line_num=0
+    local is_limitrange=0
+    local has_limits=0
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Reset on document separator or new kind
+        if [[ "$line" =~ ^---[[:space:]]*$ ]]; then
+            is_limitrange=0
+            has_limits=0
+            continue
+        fi
+
+        # Detect LimitRange kind
+        if [[ "$line" =~ ^kind:[[:space:]]*LimitRange ]]; then
+            is_limitrange=1
+        elif [[ "$line" =~ ^kind:[[:space:]]* ]]; then
+            # Different kind - reset limitrange tracking
+            is_limitrange=0
+            has_limits=0
+        fi
+
+        [[ $is_limitrange -eq 0 ]] && continue
+
+        # Check limits section
+        if [[ "$line" =~ ^[[:space:]]*limits:[[:space:]]*$ ]]; then
+            has_limits=1
+        fi
+
+        # Validate type (match both "  type:" and "  - type:")
+        if [[ "$line" =~ ^[[:space:]]*-?[[:space:]]*type:[[:space:]]+([^[:space:]#]+) ]]; then
+            local lr_type="${BASH_REMATCH[1]}"
+            if [[ ! "$lr_type" =~ ^(Container|Pod|PersistentVolumeClaim)$ ]]; then
+                errors+=("Строка $line_num: [ERROR] Недопустимый LimitRange type: '$lr_type'")
+                errors+=("  Допустимо: Container, Pod, PersistentVolumeClaim")
+            fi
+        fi
+    done < "$file"
+
+    if [[ $is_limitrange -eq 1 && $has_limits -eq 0 ]]; then
+        errors+=("[ERROR] LimitRange без spec.limits — обязательное поле")
+    fi
+
+    if [[ ${#errors[@]} -gt 0 ]]; then
+        printf '%s\n' "${errors[@]}"
+        return 1
+    fi
+
+    if [[ ${#warnings[@]} -gt 0 ]]; then
+        printf '%s\n' "${warnings[@]}"
+    fi
+    return 0
+}
+
+# =============================================================================
+# E24: terminationGracePeriodSeconds validation (v2.9.0)
+# =============================================================================
+check_termination_grace() {
+    local file="$1"
+    local warnings=()
+    local line_num=0
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Check terminationGracePeriodSeconds
+        if [[ "$line" =~ ^[[:space:]]*terminationGracePeriodSeconds:[[:space:]]+([0-9]+) ]]; then
+            local grace="${BASH_REMATCH[1]}"
+
+            if [[ $grace -eq 0 ]]; then
+                warnings+=("Строка $line_num: [WARNING] terminationGracePeriodSeconds: 0 — force kill")
+                warnings+=("  Риск: контейнер будет убит немедленно без graceful shutdown")
+                warnings+=("  Рекомендация: используйте ≥ 30s для graceful termination")
+            elif [[ $grace -gt 600 ]]; then
+                warnings+=("Строка $line_num: [WARNING] terminationGracePeriodSeconds: $grace (>10 минут)")
+                warnings+=("  Риск: слишком долгий grace period может замедлить деплои")
+                warnings+=("  Рекомендация: обычно достаточно 30-120s")
+            fi
+        fi
+    done < "$file"
+
+    if [[ ${#warnings[@]} -gt 0 ]]; then
+        printf '%s\n' "${warnings[@]}"
+    fi
+    return 0
+}
+
+# =============================================================================
+# E25: TopologySpreadConstraints validation (v2.9.0)
+# =============================================================================
+check_topology_spread() {
+    local file="$1"
+    local errors=()
+    local warnings=()
+    local line_num=0
+    local in_topology=0
+    local topology_indent=0
+    local has_max_skew=0
+    local has_topology_key=0
+    local has_when_unsatisfiable=0
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Detect topologySpreadConstraints
+        if [[ "$line" =~ ^([[:space:]]*)topologySpreadConstraints:[[:space:]]*$ ]]; then
+            in_topology=1
+            topology_indent=${#BASH_REMATCH[1]}
+            has_max_skew=0
+            has_topology_key=0
+            has_when_unsatisfiable=0
+            continue
+        fi
+
+        # Exit topology section (indent-based)
+        if [[ $in_topology -eq 1 && "$line" =~ ^([[:space:]]*)([a-zA-Z]+):[[:space:]]* ]]; then
+            local current_indent=${#BASH_REMATCH[1]}
+            # Exit if same or less indent than topologySpreadConstraints AND not a list item
+            if [[ $current_indent -le $topology_indent && ! "$line" =~ ^[[:space:]]*- ]]; then
+                # Check required fields
+                if [[ $has_max_skew -eq 0 || $has_topology_key -eq 0 || $has_when_unsatisfiable -eq 0 ]]; then
+                    errors+=("[ERROR] topologySpreadConstraints неполный")
+                    errors+=("  Обязательные поля: maxSkew, topologyKey, whenUnsatisfiable")
+                fi
+                in_topology=0
+            fi
+        fi
+
+        [[ $in_topology -eq 0 ]] && continue
+
+        # Validate maxSkew
+        if [[ "$line" =~ ^[[:space:]]*-?[[:space:]]*maxSkew:[[:space:]]+([0-9]+) ]]; then
+            has_max_skew=1
+            local skew="${BASH_REMATCH[1]}"
+            if [[ $skew -lt 1 ]]; then
+                errors+=("Строка $line_num: [ERROR] maxSkew должен быть ≥ 1, получено: $skew")
+            fi
+        fi
+
+        # Validate topologyKey
+        if [[ "$line" =~ ^[[:space:]]*-?[[:space:]]*topologyKey:[[:space:]]+([^[:space:]#]+) ]]; then
+            has_topology_key=1
+            local key="${BASH_REMATCH[1]}"
+            # Common topology keys
+            if [[ ! "$key" =~ ^(kubernetes.io/hostname|topology.kubernetes.io/zone|topology.kubernetes.io/region) ]]; then
+                warnings+=("Строка $line_num: [INFO] Нестандартный topologyKey: '$key'")
+                warnings+=("  Стандартные: kubernetes.io/hostname, topology.kubernetes.io/zone")
+            fi
+        fi
+
+        # Validate whenUnsatisfiable
+        if [[ "$line" =~ ^[[:space:]]*-?[[:space:]]*whenUnsatisfiable:[[:space:]]+([^[:space:]#]+) ]]; then
+            has_when_unsatisfiable=1
+            local when="${BASH_REMATCH[1]}"
+            if [[ ! "$when" =~ ^(DoNotSchedule|ScheduleAnyway)$ ]]; then
+                errors+=("Строка $line_num: [ERROR] Недопустимое whenUnsatisfiable: '$when'")
+                errors+=("  Допустимо: DoNotSchedule, ScheduleAnyway")
+            fi
+        fi
+    done < "$file"
+
+    if [[ ${#errors[@]} -gt 0 ]]; then
+        printf '%s\n' "${errors[@]}"
+        return 1
+    fi
+
+    if [[ ${#warnings[@]} -gt 0 ]]; then
+        printf '%s\n' "${warnings[@]}"
+    fi
+    return 0
+}
+
+# =============================================================================
+# E26: Webhook configuration validation (v2.9.0)
+# =============================================================================
+check_webhook_config() {
+    local file="$1"
+    local errors=()
+    local warnings=()
+    local line_num=0
+    local is_webhook=0
+    local webhook_type=""
+    local has_webhooks=0
+    local has_client_config=0
+    local failure_policy=""
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Detect Webhook kinds
+        if [[ "$line" =~ ^kind:[[:space:]]+(ValidatingWebhookConfiguration|MutatingWebhookConfiguration) ]]; then
+            is_webhook=1
+            webhook_type="${BASH_REMATCH[1]}"
+        fi
+
+        [[ $is_webhook -eq 0 ]] && continue
+
+        # Check webhooks section
+        if [[ "$line" =~ ^[[:space:]]*webhooks:[[:space:]]*$ ]]; then
+            has_webhooks=1
+        fi
+
+        # Check clientConfig
+        if [[ "$line" =~ ^[[:space:]]+clientConfig:[[:space:]]*$ ]]; then
+            has_client_config=1
+        fi
+
+        # Validate failurePolicy
+        if [[ "$line" =~ ^[[:space:]]+failurePolicy:[[:space:]]+([^[:space:]#]+) ]]; then
+            failure_policy="${BASH_REMATCH[1]}"
+            if [[ ! "$failure_policy" =~ ^(Ignore|Fail)$ ]]; then
+                errors+=("Строка $line_num: [ERROR] Недопустимый failurePolicy: '$failure_policy'")
+                errors+=("  Допустимо: Ignore, Fail")
+            fi
+
+            if [[ "$failure_policy" == "Fail" ]]; then
+                warnings+=("Строка $line_num: [WARNING] failurePolicy=Fail — webhook может заблокировать весь namespace")
+                warnings+=("  Риск: если webhook недоступен, все создания/обновления будут отклонены")
+                warnings+=("  Рекомендация: используйте 'Ignore' для non-critical webhooks")
+            fi
+        fi
+
+        # Validate sideEffects
+        if [[ "$line" =~ ^[[:space:]]+sideEffects:[[:space:]]+([^[:space:]#]+) ]]; then
+            local side_effects="${BASH_REMATCH[1]}"
+            if [[ ! "$side_effects" =~ ^(None|NoneOnDryRun|Some|Unknown)$ ]]; then
+                errors+=("Строка $line_num: [ERROR] Недопустимый sideEffects: '$side_effects'")
+                errors+=("  Допустимо: None, NoneOnDryRun, Some, Unknown")
+            fi
+
+            if [[ "$side_effects" == "Unknown" ]]; then
+                warnings+=("Строка $line_num: [WARNING] sideEffects=Unknown deprecated с K8s 1.22")
+                warnings+=("  Используйте: None, NoneOnDryRun, или Some")
+            fi
+        fi
+
+        # Validate admissionReviewVersions
+        if [[ "$line" =~ ^[[:space:]]+admissionReviewVersions:[[:space:]]*$ ]]; then
+            : # Next lines will have versions
+        elif [[ "$line" =~ ^[[:space:]]*-[[:space:]]+(v1|v1beta1)[[:space:]]*$ ]]; then
+            : # Valid version
+        fi
+    done < "$file"
+
+    if [[ $is_webhook -eq 1 ]]; then
+        if [[ $has_webhooks -eq 0 ]]; then
+            errors+=("[ERROR] $webhook_type без webhooks — обязательное поле")
+        fi
+    fi
+
+    if [[ ${#errors[@]} -gt 0 ]]; then
+        printf '%s\n' "${errors[@]}"
+        return 1
+    fi
+
+    if [[ ${#warnings[@]} -gt 0 ]]; then
+        printf '%s\n' "${warnings[@]}"
+    fi
+    return 0
+}
+
+# =============================================================================
+# E27: StatefulSet volumeClaimTemplates validation (v2.9.0)
+# =============================================================================
+check_statefulset_volumes() {
+    local file="$1"
+    local warnings=()
+    local line_num=0
+    local is_statefulset=0
+    local has_volume_claim_templates=0
+    local has_persistent_volume=0
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Detect StatefulSet kind
+        if [[ "$line" =~ ^kind:[[:space:]]*StatefulSet ]]; then
+            is_statefulset=1
+        fi
+
+        [[ $is_statefulset -eq 0 ]] && continue
+
+        # Check volumeClaimTemplates
+        if [[ "$line" =~ ^[[:space:]]*volumeClaimTemplates:[[:space:]]*$ ]]; then
+            has_volume_claim_templates=1
+        fi
+
+        # Check if volumes reference PVC
+        if [[ "$line" =~ ^[[:space:]]+persistentVolumeClaim:[[:space:]]*$ ]]; then
+            has_persistent_volume=1
+        fi
+    done < "$file"
+
+    if [[ $is_statefulset -eq 1 ]]; then
+        if [[ $has_volume_claim_templates -eq 0 && $has_persistent_volume -eq 0 ]]; then
+            warnings+=("[INFO] StatefulSet без volumeClaimTemplates")
+            warnings+=("  StatefulSet обычно используются для stateful приложений с persistent storage")
+            warnings+=("  Рекомендация: добавьте volumeClaimTemplates если нужен persistent storage")
+        fi
+    fi
+
+    if [[ ${#warnings[@]} -gt 0 ]]; then
+        printf '%s\n' "${warnings[@]}"
+    fi
+    return 0
+}
+
+# =============================================================================
+# E28: Init containers validation (v2.9.0)
+# =============================================================================
+check_init_containers() {
+    local file="$1"
+    local warnings=()
+    local errors=()
+    local line_num=0
+    local in_init=0
+    local init_indent=0
+    local container_name=""
+    local has_image=0
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Detect initContainers section
+        if [[ "$line" =~ ^([[:space:]]*)initContainers:[[:space:]]*$ ]]; then
+            in_init=1
+            init_indent=${#BASH_REMATCH[1]}
+            continue
+        fi
+
+        # Exit initContainers section when we find a key at same or less indent level
+        if [[ $in_init -eq 1 && "$line" =~ ^([[:space:]]*)([a-zA-Z]+):[[:space:]]* ]]; then
+            local current_indent=${#BASH_REMATCH[1]}
+            local key="${BASH_REMATCH[2]}"
+            # Exit if same or less indent than initContainers (and not a list item)
+            if [[ $current_indent -le $init_indent && ! "$line" =~ ^[[:space:]]*- ]]; then
+                in_init=0
+            fi
+        fi
+
+        [[ $in_init -eq 0 ]] && continue
+
+        # Detect container name
+        if [[ "$line" =~ ^[[:space:]]*-[[:space:]]+name:[[:space:]]+([^[:space:]#]+) ]]; then
+            container_name="${BASH_REMATCH[1]}"
+            has_image=0
+        fi
+
+        # Check image
+        if [[ "$line" =~ ^[[:space:]]+image:[[:space:]]+([^[:space:]#]+) ]]; then
+            has_image=1
+            local image="${BASH_REMATCH[1]}"
+
+            # Check for :latest tag
+            if [[ "$image" =~ :latest$ ]]; then
+                warnings+=("Строка $line_num: [WARNING] initContainer '$container_name': tag :latest не рекомендуется")
+                warnings+=("  Используйте конкретный тег для воспроизводимости")
+            fi
+        fi
+
+        # initContainers should NOT have probes
+        if [[ "$line" =~ ^[[:space:]]+(livenessProbe|readinessProbe|startupProbe): ]]; then
+            local probe_type="${BASH_REMATCH[1]}"
+            errors+=("Строка $line_num: [ERROR] initContainer '$container_name': не должен иметь $probe_type")
+            errors+=("  initContainers выполняются до старта основных контейнеров, probes не применимы")
+        fi
+
+        # initContainers can have resources (и должны!)
+        # This is already covered by check_missing_limits()
+    done < "$file"
+
+    if [[ ${#errors[@]} -gt 0 ]]; then
+        printf '%s\n' "${errors[@]}"
+        return 1
+    fi
+
+    if [[ ${#warnings[@]} -gt 0 ]]; then
+        printf '%s\n' "${warnings[@]}"
+    fi
+    return 0
+}
+
+# =============================================================================
+# E29: CronJob concurrencyPolicy validation (v2.9.0)
+# =============================================================================
+check_cronjob_concurrency() {
+    local file="$1"
+    local warnings=()
+    local line_num=0
+    local is_cronjob=0
+    local has_concurrency_policy=0
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++))
+
+        # Detect CronJob kind
+        if [[ "$line" =~ ^kind:[[:space:]]*CronJob ]]; then
+            is_cronjob=1
+        fi
+
+        [[ $is_cronjob -eq 0 ]] && continue
+
+        # Check concurrencyPolicy
+        if [[ "$line" =~ ^[[:space:]]+concurrencyPolicy:[[:space:]]+([^[:space:]#]+) ]]; then
+            has_concurrency_policy=1
+            local policy="${BASH_REMATCH[1]}"
+
+            if [[ ! "$policy" =~ ^(Allow|Forbid|Replace)$ ]]; then
+                warnings+=("Строка $line_num: [ERROR] Недопустимый concurrencyPolicy: '$policy'")
+                warnings+=("  Допустимо: Allow, Forbid, Replace")
+                return 1
+            fi
+        fi
+    done < "$file"
+
+    if [[ $is_cronjob -eq 1 && $has_concurrency_policy -eq 0 ]]; then
+        warnings+=("[INFO] CronJob без явного concurrencyPolicy")
+        warnings+=("  По умолчанию: Allow (могут запускаться параллельные jobs)")
+        warnings+=("  Рекомендация: укажите Forbid или Replace если параллельный запуск нежелателен")
+    fi
+
+    if [[ ${#warnings[@]} -gt 0 ]]; then
+        printf '%s\n' "${warnings[@]}"
+    fi
+    return 0
+}
+
 validate_yaml_file() {
     local file="$1"
     local verbose="$2"
@@ -5947,7 +6774,7 @@ validate_yaml_file() {
     # Reset severity counters for this file
     reset_severity_counts
 
-    [[ $JSON_OUTPUT -eq 0 ]] && echo -e "${BLUE}[ПРОВЕРЯЮ]${NC} $file"
+    [[ $JSON_OUTPUT -eq 0 && $QUIET_MODE -eq 0 ]] && echo -e "${BLUE}[ПРОВЕРЯЮ]${NC} $file"
 
     # Critical checks first
     if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
@@ -6056,7 +6883,7 @@ validate_yaml_file() {
     if ! marker_errors=$(check_document_markers "$file"); then
         file_errors+=("=== ОШИБКИ МАРКЕРОВ ДОКУМЕНТА ===")
         file_errors+=("$marker_errors")
-        parse_errors_to_json "structure" "DOCUMENT_MARKERS" "ERROR" "$marker_errors" "false" ""
+        parse_errors_to_json "structure" "DOCUMENT_MARKERS" "ERROR" "$marker_errors" "true" "doc_markers"
     fi
 
     if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
@@ -6689,7 +7516,7 @@ validate_yaml_file() {
     if [[ -n "$comment_warnings" ]]; then
         file_errors+=("=== СТИЛЬ: COMMENTS ===")
         file_errors+=("$comment_warnings")
-        parse_errors_to_json "style" "COMMENT_FORMAT" "INFO" "$comment_warnings" "false" ""
+        parse_errors_to_json "style" "COMMENT_FORMAT" "INFO" "$comment_warnings" "true" "comment_space"
     fi
 
     if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
@@ -6733,7 +7560,7 @@ validate_yaml_file() {
     if [[ -n "$colon_warnings" ]]; then
         file_errors+=("=== СТИЛЬ: COLONS SPACING ===")
         file_errors+=("$colon_warnings")
-        parse_errors_to_json "style" "COLONS_SPACING" "INFO" "$colon_warnings" "true" "colons"
+        parse_errors_to_json "style" "COLONS_SPACING" "INFO" "$colon_warnings" "true" "colon_spacing"
     fi
 
     if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
@@ -6744,7 +7571,29 @@ validate_yaml_file() {
     if [[ -n "$bracket_warnings" ]]; then
         file_errors+=("=== СТИЛЬ: BRACKETS SPACING ===")
         file_errors+=("$bracket_warnings")
-        parse_errors_to_json "style" "BRACKETS_SPACING" "INFO" "$bracket_warnings" "false" ""
+        parse_errors_to_json "style" "BRACKETS_SPACING" "INFO" "$bracket_warnings" "true" "bracket_spacing"
+    fi
+
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+        echo -e "  ${CYAN}├─ Проверка регистра boolean значений...${NC}"
+    fi
+    local boolean_warnings
+    boolean_warnings=$(check_boolean_case "$file")
+    if [[ -n "$boolean_warnings" ]]; then
+        file_errors+=("=== СТИЛЬ: BOOLEAN CASE ===")
+        file_errors+=("$boolean_warnings")
+        parse_errors_to_json "style" "BOOLEAN_CASE" "INFO" "$boolean_warnings" "true" "booleans"
+    fi
+
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+        echo -e "  ${CYAN}├─ Проверка пробелов в списках...${NC}"
+    fi
+    local list_warnings
+    list_warnings=$(check_list_spacing "$file")
+    if [[ -n "$list_warnings" ]]; then
+        file_errors+=("=== СТИЛЬ: LIST SPACING ===")
+        file_errors+=("$list_warnings")
+        parse_errors_to_json "style" "LIST_SPACING" "INFO" "$list_warnings" "true" "list_spacing"
     fi
 
     if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
@@ -6908,6 +7757,130 @@ validate_yaml_file() {
         parse_errors_to_json "best_practice" "DANGLING_RESOURCES" "INFO" "$dangling_warnings" "false" ""
     fi
 
+    # === NEW CHECKS v2.9.0 ===
+
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+        echo -e "  ${CYAN}├─ Проверка resource limits...${NC}"
+    fi
+    local limits_warnings
+    limits_warnings=$(check_missing_limits "$file")
+    if [[ -n "$limits_warnings" ]]; then
+        file_errors+=("=== BEST PRACTICE: RESOURCE LIMITS ===")
+        file_errors+=("$limits_warnings")
+        parse_errors_to_json "best_practice" "MISSING_LIMITS" "WARNING" "$limits_warnings" "false" ""
+    fi
+
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+        echo -e "  ${CYAN}├─ Проверка init containers...${NC}"
+    fi
+    local init_errors
+    init_errors=$(check_init_containers "$file")
+    if [[ -n "$init_errors" ]]; then
+        file_errors+=("=== KUBERNETES: INIT CONTAINERS ===")
+        file_errors+=("$init_errors")
+        # Parse severity from output (WARNING or ERROR)
+        local init_severity="WARNING"
+        if [[ "$init_errors" =~ \[ERROR\] ]]; then
+            init_severity="ERROR"
+        fi
+        parse_errors_to_json "kubernetes" "INIT_CONTAINERS" "$init_severity" "$init_errors" "false" ""
+    fi
+
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+        echo -e "  ${CYAN}├─ Проверка PVC...${NC}"
+    fi
+    local pvc_errors
+    if ! pvc_errors=$(check_pvc_validation "$file"); then
+        file_errors+=("=== KUBERNETES: PVC VALIDATION ===")
+        file_errors+=("$pvc_errors")
+        parse_errors_to_json "kubernetes" "PVC_VALIDATION" "ERROR" "$pvc_errors" "false" ""
+    fi
+
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+        echo -e "  ${CYAN}├─ Проверка ResourceQuota...${NC}"
+    fi
+    local quota_errors
+    quota_errors=$(check_resource_quota "$file")
+    if [[ -n "$quota_errors" ]]; then
+        file_errors+=("=== KUBERNETES: RESOURCE QUOTA ===")
+        file_errors+=("$quota_errors")
+        # Parse severity from output (WARNING or ERROR)
+        local quota_severity="WARNING"
+        if [[ "$quota_errors" =~ \[ERROR\] ]]; then
+            quota_severity="ERROR"
+        fi
+        parse_errors_to_json "kubernetes" "RESOURCE_QUOTA" "$quota_severity" "$quota_errors" "false" ""
+    fi
+
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+        echo -e "  ${CYAN}├─ Проверка LimitRange...${NC}"
+    fi
+    local limitrange_errors
+    limitrange_errors=$(check_limit_range "$file")
+    if [[ -n "$limitrange_errors" ]]; then
+        file_errors+=("=== KUBERNETES: LIMIT RANGE ===")
+        file_errors+=("$limitrange_errors")
+        # Parse severity from output (WARNING or ERROR)
+        local limitrange_severity="WARNING"
+        if [[ "$limitrange_errors" =~ \[ERROR\] ]]; then
+            limitrange_severity="ERROR"
+        fi
+        parse_errors_to_json "kubernetes" "LIMIT_RANGE" "$limitrange_severity" "$limitrange_errors" "false" ""
+    fi
+
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+        echo -e "  ${CYAN}├─ Проверка terminationGracePeriodSeconds...${NC}"
+    fi
+    local grace_warnings
+    grace_warnings=$(check_termination_grace "$file")
+    if [[ -n "$grace_warnings" ]]; then
+        file_errors+=("=== BEST PRACTICE: TERMINATION GRACE ===")
+        file_errors+=("$grace_warnings")
+        parse_errors_to_json "best_practice" "TERMINATION_GRACE" "WARNING" "$grace_warnings" "false" ""
+    fi
+
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+        echo -e "  ${CYAN}├─ Проверка topologySpreadConstraints...${NC}"
+    fi
+    local topology_errors
+    if ! topology_errors=$(check_topology_spread "$file"); then
+        file_errors+=("=== KUBERNETES: TOPOLOGY SPREAD ===")
+        file_errors+=("$topology_errors")
+        parse_errors_to_json "kubernetes" "TOPOLOGY_SPREAD" "ERROR" "$topology_errors" "false" ""
+    fi
+
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+        echo -e "  ${CYAN}├─ Проверка Webhook configuration...${NC}"
+    fi
+    local webhook_errors
+    if ! webhook_errors=$(check_webhook_config "$file"); then
+        file_errors+=("=== KUBERNETES: WEBHOOK CONFIG ===")
+        file_errors+=("$webhook_errors")
+        parse_errors_to_json "kubernetes" "WEBHOOK_CONFIG" "ERROR" "$webhook_errors" "false" ""
+    fi
+
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+        echo -e "  ${CYAN}├─ Проверка StatefulSet volumes...${NC}"
+    fi
+    local stateful_warnings
+    stateful_warnings=$(check_statefulset_volumes "$file")
+    if [[ -n "$stateful_warnings" ]]; then
+        file_errors+=("=== BEST PRACTICE: STATEFULSET VOLUMES ===")
+        file_errors+=("$stateful_warnings")
+        parse_errors_to_json "best_practice" "STATEFULSET_VOLUMES" "INFO" "$stateful_warnings" "false" ""
+    fi
+
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+        echo -e "  ${CYAN}└─ Проверка CronJob concurrencyPolicy...${NC}"
+    fi
+    local cronjob_warnings
+    cronjob_warnings=$(check_cronjob_concurrency "$file")
+    if [[ -n "$cronjob_warnings" ]]; then
+        file_errors+=("=== BEST PRACTICE: CRONJOB CONCURRENCY ===")
+        file_errors+=("$cronjob_warnings")
+        parse_errors_to_json "best_practice" "CRONJOB_CONCURRENCY" "INFO" "$cronjob_warnings" "false" ""
+    fi
+
     # Add severity counts to totals
     add_to_totals
 
@@ -6919,16 +7892,16 @@ validate_yaml_file() {
     [[ ${SEVERITY_COUNTS[SECURITY]} -gt 0 ]] && severity_summary+=" S:${SEVERITY_COUNTS[SECURITY]}"
 
     if [[ ${#file_errors[@]} -eq 0 ]]; then
-        [[ $JSON_OUTPUT -eq 0 ]] && echo -e "${GREEN}[✓ УСПЕХ]${NC} $file - ошибок не найдено"
+        [[ $JSON_OUTPUT -eq 0 && $QUIET_MODE -eq 0 ]] && echo -e "${GREEN}[✓ УСПЕХ]${NC} $file - ошибок не найдено"
         ((PASSED_FILES++))
         return 0
     else
         # Check if this should be a failure based on severity mode
         if file_has_errors; then
-            [[ $JSON_OUTPUT -eq 0 ]] && echo -e "${RED}[✗ ОШИБКА]${NC} $file - обнаружены проблемы [${severity_summary# }]"
+            [[ $JSON_OUTPUT -eq 0 && $QUIET_MODE -eq 0 ]] && echo -e "${RED}[✗ ОШИБКА]${NC} $file - обнаружены проблемы [${severity_summary# }]"
             ((FAILED_FILES++))
         else
-            [[ $JSON_OUTPUT -eq 0 ]] && echo -e "${YELLOW}[⚠ ПРЕДУПРЕЖДЕНИЯ]${NC} $file - найдены замечания [${severity_summary# }]"
+            [[ $JSON_OUTPUT -eq 0 && $QUIET_MODE -eq 0 ]] && echo -e "${YELLOW}[⚠ ПРЕДУПРЕЖДЕНИЯ]${NC} $file - найдены замечания [${severity_summary# }]"
             ((PASSED_FILES++))
         fi
         ERRORS_FOUND+=("" "═══════════════════════════════════════════════════════════════════════")
@@ -7013,12 +7986,18 @@ main() {
     local output_file="yaml_validation_report.txt"
     local output_file_explicit=0
 
+    # Detect optional tools at startup
+    detect_optional_tools
+
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -h|--help) usage ;;
             -r|--recursive) recursive=1; shift ;;
             -v|--verbose) verbose=1; shift ;;
+            -q|--quiet) QUIET_MODE=1; shift ;;
             -s|--strict) STRICT_MODE=1; shift ;;
+            --fix) AUTO_FIX=1; shift ;;
+            --fixer-path) FIXER_PATH="$2"; shift 2 ;;
             --security-mode)
                 case "$2" in
                     strict|normal|permissive) SECURITY_MODE="$2" ;;
@@ -7048,21 +8027,24 @@ main() {
 
     TARGET_DIR="$target_dir"
 
-    # In JSON mode, suppress console output
-    if [[ $JSON_OUTPUT -eq 0 ]]; then
+    # In JSON mode or quiet mode, suppress console output
+    if [[ $JSON_OUTPUT -eq 0 && $QUIET_MODE -eq 0 ]]; then
         print_header
         echo -e "${BOLD}Начинаю валидацию YAML файлов...${NC}"
     fi
 
     # Handle both files and directories
     if [[ -f "$target_dir" ]]; then
-        [[ $JSON_OUTPUT -eq 0 ]] && echo -e "Файл: ${CYAN}$target_dir${NC}"
+        [[ $JSON_OUTPUT -eq 0 && $QUIET_MODE -eq 0 ]] && echo -e "Файл: ${CYAN}$target_dir${NC}"
         yaml_files=("$target_dir")
     else
-        if [[ $JSON_OUTPUT -eq 0 ]]; then
+        if [[ $JSON_OUTPUT -eq 0 && $QUIET_MODE -eq 0 ]]; then
             echo -e "Директория: ${CYAN}$target_dir${NC}"
             echo -e "Режим: ${CYAN}$([ $recursive -eq 1 ] && echo "Рекурсивный" || echo "Только текущая директория")${NC}"
             echo -e "Безопасность: ${CYAN}$SECURITY_MODE${NC}$([ $STRICT_MODE -eq 1 ] && echo " + ${YELLOW}STRICT${NC}")"
+            [[ ${OPTIONAL_TOOLS[jq]} -eq 1 ]] && echo -e "Дополнительно: ${GREEN}jq${NC} $(command -v jq)"
+            [[ ${OPTIONAL_TOOLS[yq]} -eq 1 ]] && echo -e "Дополнительно: ${GREEN}yq${NC} $(command -v yq)"
+            [[ ${OPTIONAL_TOOLS[yamllint]} -eq 1 ]] && echo -e "Дополнительно: ${GREEN}yamllint${NC} $(command -v yamllint)"
             echo ""
             echo -e "${YELLOW}[ПОИСК]${NC} Сканирование файлов..."
         fi
@@ -7079,8 +8061,8 @@ main() {
         exit 0
     fi
 
-    [[ $JSON_OUTPUT -eq 0 ]] && echo -e "${GREEN}Найдено файлов: $TOTAL_FILES${NC}"
-    [[ $JSON_OUTPUT -eq 0 ]] && echo ""
+    [[ $JSON_OUTPUT -eq 0 && $QUIET_MODE -eq 0 ]] && echo -e "${GREEN}Найдено файлов: $TOTAL_FILES${NC}"
+    [[ $JSON_OUTPUT -eq 0 && $QUIET_MODE -eq 0 ]] && echo ""
 
     for file in "${yaml_files[@]}"; do
         [[ $JSON_OUTPUT -eq 1 ]] && json_start_file "$file"
@@ -7096,23 +8078,73 @@ main() {
             output_json_report ""
         fi
     else
-        echo ""
-        echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-        echo -e "${BOLD}ИТОГИ ВАЛИДАЦИИ${NC}"
-        echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-        echo -e "Всего проверено:  ${BOLD}$TOTAL_FILES${NC} файлов"
-        echo -e "Успешно:          ${GREEN}$PASSED_FILES${NC} файлов"
-        echo -e "С ошибками:       ${RED}$FAILED_FILES${NC} файлов"
-        echo ""
+        if [[ $QUIET_MODE -eq 0 ]]; then
+            echo ""
+            echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+            echo -e "${BOLD}ИТОГИ ВАЛИДАЦИИ${NC}"
+            echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+            echo -e "Всего проверено:  ${BOLD}$TOTAL_FILES${NC} файлов"
+            echo -e "Успешно:          ${GREEN}$PASSED_FILES${NC} файлов"
+            echo -e "С ошибками:       ${RED}$FAILED_FILES${NC} файлов"
+            echo ""
 
-        generate_report "$output_file"
+            generate_report "$output_file"
+        fi
+    fi
+
+    # Auto-fix mode: run fixer after validation if there are fixable issues
+    # Auto-fix mode: run fixer if there are any errors or warnings (fixable issues)
+    if [[ $AUTO_FIX -eq 1 && ${#ERRORS_FOUND[@]} -gt 0 ]]; then
+        if [[ $JSON_OUTPUT -eq 0 && $QUIET_MODE -eq 0 ]]; then
+            echo ""
+            echo -e "${BOLD}${CYAN}РЕЖИМ АВТОИСПРАВЛЕНИЯ${NC}"
+            echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+            echo -e "Запуск фиксатора: ${CYAN}$FIXER_PATH${NC}"
+            echo ""
+        fi
+
+        if [[ ! -f "$FIXER_PATH" ]]; then
+            [[ $QUIET_MODE -eq 0 ]] && echo -e "${YELLOW}Предупреждение: Фиксатор не найден: $FIXER_PATH${NC}"
+        else
+            # Generate JSON report for fixer if not already in JSON mode
+            local temp_report=""
+            if [[ $JSON_OUTPUT -eq 0 ]]; then
+                temp_report=$(mktemp)
+                JSON_OUTPUT=1
+                output_json_report "$temp_report"
+                JSON_OUTPUT=0
+            else
+                # Already have JSON output
+                temp_report="$output_file"
+            fi
+
+            # Run fixer with --from-report
+            if [[ -f "$temp_report" ]]; then
+                if [[ $recursive -eq 1 ]]; then
+                    "$FIXER_PATH" --from-report "$temp_report" -r "$target_dir"
+                else
+                    "$FIXER_PATH" --from-report "$temp_report" "$target_dir"
+                fi
+                local fixer_exit=$?
+
+                # Clean up temp report if created
+                [[ $JSON_OUTPUT -eq 0 && -n "$temp_report" ]] && rm -f "$temp_report"
+
+                if [[ $fixer_exit -eq 0 ]]; then
+                    [[ $QUIET_MODE -eq 0 ]] && echo -e "${GREEN}Автоисправление завершено успешно${NC}"
+                    [[ $QUIET_MODE -eq 0 ]] && echo -e "${YELLOW}Рекомендация: Запустите валидацию повторно для проверки${NC}"
+                else
+                    [[ $QUIET_MODE -eq 0 ]] && echo -e "${YELLOW}Фиксатор завершился с кодом $fixer_exit${NC}"
+                fi
+            fi
+        fi
     fi
 
     if [[ $FAILED_FILES -gt 0 ]]; then
-        [[ $JSON_OUTPUT -eq 0 ]] && echo -e "${RED}Валидация завершена с ошибками${NC}"
+        [[ $JSON_OUTPUT -eq 0 && $QUIET_MODE -eq 0 ]] && echo -e "${RED}Валидация завершена с ошибками${NC}"
         exit 1
     else
-        [[ $JSON_OUTPUT -eq 0 ]] && echo -e "${GREEN}Валидация успешно завершена${NC}"
+        [[ $JSON_OUTPUT -eq 0 && $QUIET_MODE -eq 0 ]] && echo -e "${GREEN}Валидация успешно завершена${NC}"
         exit 0
     fi
 }
