@@ -5,11 +5,23 @@
 # Pure bash implementation for Astra Linux SE 1.7 (Smolensk)
 # Purpose: Validate YAML files in Kubernetes clusters without external tools
 # Author: Generated for isolated environments
-# Version: 3.0.0
+# Version: 3.2.0
 # Updated: 2026-01-29
 #############################################################################
 
 set -o pipefail
+
+#############################################################################
+# PURE BASH FALLBACKS
+# Source external fallback library for minimal environment compatibility
+#############################################################################
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "$SCRIPT_DIR/lib/fallbacks.sh" ]]; then
+    source "$SCRIPT_DIR/lib/fallbacks.sh"
+else
+    echo "ERROR: fallbacks.sh not found. Install from: $SCRIPT_DIR/lib/" >&2
+    exit 2
+fi
 
 # Colors for output
 if [[ -t 1 ]]; then
@@ -166,17 +178,9 @@ detect_terminal() {
         return 1
     fi
 
-    # Get terminal dimensions via tput (preferred) or ANSI fallback
-    if command -v tput &>/dev/null; then
-        LIVE_TERM_COLS=$(tput cols 2>/dev/null || echo 80)
-        LIVE_TERM_ROWS=$(tput lines 2>/dev/null || echo 24)
-    elif [[ -n "${COLUMNS:-}" && -n "${LINES:-}" ]]; then
-        LIVE_TERM_COLS="$COLUMNS"
-        LIVE_TERM_ROWS="$LINES"
-    else
-        LIVE_TERM_COLS=80
-        LIVE_TERM_ROWS=24
-    fi
+    # Get terminal dimensions via tput_compat (with fallback)
+    LIVE_TERM_COLS=$(tput_compat cols)
+    LIVE_TERM_ROWS=$(tput_compat lines)
 
     # Ensure minimum terminal size
     (( LIVE_TERM_COLS < 40 )) && LIVE_TERM_COLS=40
@@ -1004,7 +1008,7 @@ check_bom() {
     # Check for UTF-8 BOM (EF BB BF)
     if [[ -f "$file" ]]; then
         local first_bytes
-        first_bytes=$(head -c 3 "$file" | od -An -tx1 | tr -d ' \n')
+        first_bytes=$(head -c 3 "$file" | od_compat -An -tx1 | tr -d ' \n')
         if [[ "$first_bytes" == "efbbbf" ]]; then
             errors+=("КРИТИЧЕСКАЯ ОШИБКА: Обнаружен BOM (Byte Order Mark) в начале файла")
             errors+=("  BOM-символы невидимы, но могут нарушить парсинг YAML")
@@ -5823,7 +5827,7 @@ check_newline_at_eof() {
     # Check if file ends with newline
     if [[ -s "$file" ]]; then
         local last_char
-        last_char=$(tail -c 1 "$file" | od -An -tx1 | tr -d ' ')
+        last_char=$(tail -c 1 "$file" | od_compat -An -tx1 | tr -d ' ')
 
         if [[ "$last_char" != "0a" ]] && [[ "$last_char" != "" ]]; then
             warnings+=("ПРЕДУПРЕЖДЕНИЕ: Файл не заканчивается символом новой строки")
@@ -8603,7 +8607,7 @@ main() {
                     exit 1
                 fi
                 # Canonicalize path (resolve symlinks, relative paths, prevent path traversal)
-                FIXER_PATH=$(realpath "$2" 2>/dev/null)
+                FIXER_PATH=$(realpath_compat "$2" 2>/dev/null)
                 if [[ $? -ne 0 || -z "$FIXER_PATH" ]]; then
                     echo -e "${RED}Ошибка: Неверный путь к фиксеру: $2${NC}" >&2
                     exit 1
