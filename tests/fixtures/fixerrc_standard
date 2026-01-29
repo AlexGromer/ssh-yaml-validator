@@ -1,0 +1,9 @@
+# Standard fixerrc config for testing
+resource_profile: standard
+liveness_path: /healthz
+liveness_port: 8080
+readiness_path: /ready
+readiness_port: 8080
+namespace: production
+probe_initial_delay: 30
+probe_period: 10
