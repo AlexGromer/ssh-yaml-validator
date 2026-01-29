@@ -5,8 +5,8 @@
 # Pure bash implementation for Astra Linux SE 1.7 (Smolensk)
 # Purpose: Validate YAML files in Kubernetes clusters without external tools
 # Author: Generated for isolated environments
-# Version: 2.9.0
-# Updated: 2026-01-25
+# Version: 3.0.0
+# Updated: 2026-01-29
 #############################################################################
 
 set -o pipefail
@@ -91,6 +91,540 @@ QUIET_MODE=0
 AUTO_FIX=0
 FIXER_PATH="./fix_yaml_issues.sh"
 
+# ============================================================================
+# Live Output Window — Global Variables & ANSI Codes
+# ============================================================================
+LIVE_MODE=0
+LIVE_INTERACTIVE_TTY=0       # Set to 1 if stdout is a real TTY
+LIVE_TERM_COLS=80
+LIVE_TERM_ROWS=24
+LIVE_CURRENT_FILE_IDX=0
+LIVE_CURRENT_FILE=""
+LIVE_FILES_TOTAL=0
+LIVE_ERRORS_LIVE=0
+LIVE_WARNINGS_LIVE=0
+LIVE_INFOS_LIVE=0
+LIVE_SCROLL_OFFSET=0
+LIVE_PAUSED=0
+LIVE_SHOW_HELP=0
+LIVE_KEYBOARD_PID=0
+LIVE_PIPE=""
+LIVE_START_TIME=0
+LIVE_LAST_RENDER_MS=0
+LIVE_RENDER_INTERVAL_MS=50   # 20 FPS throttle
+LIVE_HTML_REPORT=""
+
+# Circular output buffer (max 1000 lines)
+declare -a LIVE_BUFFER=()
+LIVE_BUFFER_MAX=1000
+LIVE_BUFFER_COUNT=0
+
+# ANSI escape sequences for live mode
+ANSI_HIDE_CURSOR='\033[?25l'
+ANSI_SHOW_CURSOR='\033[?25h'
+ANSI_CLEAR_SCREEN='\033[2J'
+ANSI_HOME='\033[H'
+ANSI_CLEAR_LINE='\033[2K'
+ANSI_SAVE_CURSOR='\033[s'
+ANSI_RESTORE_CURSOR='\033[u'
+ANSI_BOLD='\033[1m'
+ANSI_DIM='\033[2m'
+ANSI_RESET='\033[0m'
+ANSI_BG_BLUE='\033[44m'
+ANSI_BG_GREEN='\033[42m'
+ANSI_BG_RED='\033[41m'
+ANSI_BG_GRAY='\033[100m'
+ANSI_FG_WHITE='\033[97m'
+ANSI_FG_GREEN='\033[32m'
+ANSI_FG_RED='\033[31m'
+ANSI_FG_YELLOW='\033[33m'
+ANSI_FG_CYAN='\033[36m'
+
+# Box-drawing characters (UTF-8 with ASCII fallback)
+LIVE_USE_UTF8=1
+BOX_TL="┌" BOX_TR="┐" BOX_BL="└" BOX_BR="┘"
+BOX_H="─" BOX_V="│" BOX_HB="━"
+PROGRESS_FULL="█" PROGRESS_EMPTY="░"
+
+# ============================================================================
+# Live Output Window — Functions
+# ============================================================================
+
+# Detect terminal capabilities
+detect_terminal() {
+    # Check if stdout is a TTY
+    if [[ -t 1 ]]; then
+        LIVE_INTERACTIVE_TTY=1
+    else
+        LIVE_INTERACTIVE_TTY=0
+        return 1
+    fi
+
+    # Check for CI/non-interactive environments
+    if [[ -n "${CI:-}" || -n "${GITHUB_ACTIONS:-}" || -n "${JENKINS_URL:-}" || -n "${TRAVIS:-}" || "${TERM:-}" == "dumb" ]]; then
+        LIVE_INTERACTIVE_TTY=0
+        return 1
+    fi
+
+    # Get terminal dimensions via tput (preferred) or ANSI fallback
+    if command -v tput &>/dev/null; then
+        LIVE_TERM_COLS=$(tput cols 2>/dev/null || echo 80)
+        LIVE_TERM_ROWS=$(tput lines 2>/dev/null || echo 24)
+    elif [[ -n "${COLUMNS:-}" && -n "${LINES:-}" ]]; then
+        LIVE_TERM_COLS="$COLUMNS"
+        LIVE_TERM_ROWS="$LINES"
+    else
+        LIVE_TERM_COLS=80
+        LIVE_TERM_ROWS=24
+    fi
+
+    # Ensure minimum terminal size
+    (( LIVE_TERM_COLS < 40 )) && LIVE_TERM_COLS=40
+    (( LIVE_TERM_ROWS < 10 )) && LIVE_TERM_ROWS=10
+
+    # Check UTF-8 support
+    if [[ "${LANG:-}" != *UTF-8* && "${LANG:-}" != *utf8* && "${LC_ALL:-}" != *UTF-8* ]]; then
+        LIVE_USE_UTF8=0
+        BOX_TL="+" BOX_TR="+" BOX_BL="+" BOX_BR="+"
+        BOX_H="-" BOX_V="|" BOX_HB="="
+        PROGRESS_FULL="#" PROGRESS_EMPTY="."
+    fi
+
+    return 0
+}
+
+# Get current time in milliseconds (epoch ms)
+_live_now_ms() {
+    if [[ -f /proc/uptime ]]; then
+        local up
+        read -r up _ < /proc/uptime
+        echo "${up/./}"  # centiseconds → good enough
+    else
+        date +%s%N | cut -b1-13
+    fi
+}
+
+# Initialize live mode — hide cursor, set traps, clear screen
+init_live_mode() {
+    LIVE_START_TIME=$(date +%s)
+    printf '%b' "$ANSI_HIDE_CURSOR" >&2
+    printf '%b' "$ANSI_CLEAR_SCREEN$ANSI_HOME" >&2
+    # Trap to always restore cursor on exit/interrupt
+    trap 'cleanup_live_mode' EXIT INT TERM HUP
+}
+
+# Cleanup live mode — show cursor, restore terminal
+cleanup_live_mode() {
+    # Stop keyboard listener if running
+    if [[ $LIVE_KEYBOARD_PID -gt 0 ]]; then
+        kill "$LIVE_KEYBOARD_PID" 2>/dev/null
+        wait "$LIVE_KEYBOARD_PID" 2>/dev/null
+        LIVE_KEYBOARD_PID=0
+    fi
+    # Remove named pipe
+    [[ -n "$LIVE_PIPE" && -p "$LIVE_PIPE" ]] && rm -f "$LIVE_PIPE"
+    # Show cursor and move below the window
+    printf '%b' "$ANSI_SHOW_CURSOR" >&2
+    printf '\033[%d;1H\n' "$LIVE_TERM_ROWS" >&2
+}
+
+# Draw a progress bar: draw_progress_bar <current> <total> <width>
+# Outputs the bar string (no newline)
+draw_progress_bar() {
+    local current="$1" total="$2" width="${3:-30}"
+    local pct=0 filled=0 empty=0
+    if (( total > 0 )); then
+        pct=$(( current * 100 / total ))
+        filled=$(( current * width / total ))
+    fi
+    empty=$(( width - filled ))
+    local bar=""
+    local i
+    for (( i=0; i<filled; i++ )); do bar+="$PROGRESS_FULL"; done
+    for (( i=0; i<empty; i++ )); do bar+="$PROGRESS_EMPTY"; done
+    printf '%s %3d%%' "$bar" "$pct"
+}
+
+# Add a line to the circular output buffer
+add_to_output_buffer() {
+    local line="$1"
+    if (( LIVE_BUFFER_COUNT >= LIVE_BUFFER_MAX )); then
+        # Shift buffer: drop oldest entries (simple approach: rebuild)
+        LIVE_BUFFER=("${LIVE_BUFFER[@]:1}" "$line")
+    else
+        LIVE_BUFFER+=("$line")
+        ((LIVE_BUFFER_COUNT++))
+    fi
+}
+
+# Render header: box with file info, counters, and progress
+render_header() {
+    local cols="$LIVE_TERM_COLS"
+    local inner=$(( cols - 2 ))
+    local elapsed=$(( $(date +%s) - LIVE_START_TIME ))
+    local mins=$(( elapsed / 60 ))
+    local secs=$(( elapsed % 60 ))
+
+    # Top border
+    local border_h=""
+    local i; for (( i=0; i<inner; i++ )); do border_h+="$BOX_H"; done
+
+    printf '%b%b%s%s%s%b\n' "$ANSI_FG_CYAN" "$BOX_TL" "$border_h" "$BOX_TR" "" "$ANSI_RESET" >&2
+
+    # Title line
+    local title=" YAML Validator v3.0.0 — Live Mode"
+    local time_str
+    printf -v time_str "%02d:%02d" "$mins" "$secs"
+    local pad=$(( inner - ${#title} - ${#time_str} - 1 ))
+    (( pad < 0 )) && pad=0
+    printf '%b%s%-*s %s%s%b\n' "$ANSI_FG_CYAN" "$BOX_V" "$pad" "$title" "$time_str" "$BOX_V" "$ANSI_RESET" >&2
+
+    # File info line
+    local fname
+    if [[ -n "$LIVE_CURRENT_FILE" ]]; then
+        fname="${LIVE_CURRENT_FILE}"
+        # Truncate if too long
+        local max_fname=$(( inner - 20 ))
+        (( ${#fname} > max_fname )) && fname="...${fname: -$((max_fname-3))}"
+    else
+        fname="(waiting...)"
+    fi
+    local file_info
+    printf -v file_info " File [%d/%d]: %s" "$LIVE_CURRENT_FILE_IDX" "$LIVE_FILES_TOTAL" "$fname"
+    pad=$(( inner - ${#file_info} ))
+    (( pad < 0 )) && pad=0
+    printf '%b%s%-*s%s%b\n' "$ANSI_FG_CYAN" "$BOX_V" "$inner" "$file_info" "$BOX_V" "$ANSI_RESET" >&2
+
+    # Counters line
+    local counters
+    printf -v counters " E:%d W:%d I:%d" "$LIVE_ERRORS_LIVE" "$LIVE_WARNINGS_LIVE" "$LIVE_INFOS_LIVE"
+    local bar_width=$(( inner - ${#counters} - 3 ))
+    (( bar_width < 10 )) && bar_width=10
+    local bar_str
+    bar_str=$(draw_progress_bar "$LIVE_CURRENT_FILE_IDX" "$LIVE_FILES_TOTAL" "$bar_width")
+    local counter_line
+    printf -v counter_line " %s%s" "$bar_str" "$counters"
+    pad=$(( inner - ${#counter_line} ))
+    (( pad < 0 )) && pad=0
+    printf '%b%s%-*s%s%b\n' "$ANSI_FG_CYAN" "$BOX_V" "$inner" "$counter_line" "$BOX_V" "$ANSI_RESET" >&2
+
+    # Bottom border
+    printf '%b%s%s%s%b\n' "$ANSI_FG_CYAN" "$BOX_BL" "$border_h" "$BOX_BR" "$ANSI_RESET" >&2
+}
+
+# Render scrollable content area from circular buffer
+render_content() {
+    local cols="$LIVE_TERM_COLS"
+    # Content area: total rows minus header (5 lines) minus footer (2 lines)
+    local content_rows=$(( LIVE_TERM_ROWS - 7 ))
+    (( content_rows < 3 )) && content_rows=3
+
+    local total=${#LIVE_BUFFER[@]}
+    local start=0
+
+    if (( LIVE_SCROLL_OFFSET > 0 )); then
+        # Manual scroll: show from offset
+        start=$LIVE_SCROLL_OFFSET
+        (( start + content_rows > total )) && start=$(( total - content_rows ))
+        (( start < 0 )) && start=0
+    else
+        # Auto-scroll: show latest lines
+        start=$(( total - content_rows ))
+        (( start < 0 )) && start=0
+    fi
+
+    local i
+    for (( i=0; i<content_rows; i++ )); do
+        local idx=$(( start + i ))
+        printf '%b' "$ANSI_CLEAR_LINE" >&2
+        if (( idx < total )); then
+            local line="${LIVE_BUFFER[$idx]}"
+            # Truncate to terminal width
+            if (( ${#line} > cols )); then
+                line="${line:0:$((cols-1))}"
+            fi
+            printf '%s\n' "$line" >&2
+        else
+            printf '\n' >&2
+        fi
+    done
+}
+
+# Render footer status bar
+render_footer() {
+    local cols="$LIVE_TERM_COLS"
+
+    # Status bar background
+    local status=""
+    if [[ $LIVE_PAUSED -eq 1 ]]; then
+        status=" PAUSED"
+    else
+        status=" RUNNING"
+    fi
+
+    local shortcuts=" F1:Help F2:Pause F3:Errors Q:Quit"
+    local scroll_info=""
+    if (( LIVE_SCROLL_OFFSET > 0 )); then
+        scroll_info=" [scroll:${LIVE_SCROLL_OFFSET}]"
+    fi
+
+    local left="${status}${scroll_info}"
+    local right="$shortcuts "
+    local pad=$(( cols - ${#left} - ${#right} ))
+    (( pad < 0 )) && pad=0
+
+    printf '%b%b%b%-*s%s%b\n' "$ANSI_BG_BLUE" "$ANSI_FG_WHITE" "$left" "$pad" "" "$right" "$ANSI_RESET" >&2
+
+    # Separator line
+    local sep=""
+    local i; for (( i=0; i<cols; i++ )); do sep+="$BOX_HB"; done
+    printf '%b%s%b\n' "$ANSI_DIM" "$sep" "$ANSI_RESET" >&2
+}
+
+# Render help overlay
+render_help_overlay() {
+    local cols="$LIVE_TERM_COLS"
+    local content_rows=$(( LIVE_TERM_ROWS - 7 ))
+    (( content_rows < 3 )) && content_rows=3
+
+    local help_lines=(
+        ""
+        "  YAML Validator — Live Mode Help"
+        "  ================================"
+        ""
+        "  F1        Toggle this help"
+        "  F2        Pause / Resume output"
+        "  F3        Jump to next error"
+        "  Up/Down   Scroll output"
+        "  Home      Scroll to top"
+        "  End       Scroll to bottom (auto-follow)"
+        "  Q / Esc   Quit live mode"
+        ""
+        "  Press F1 to close"
+        ""
+    )
+
+    local i
+    for (( i=0; i<content_rows; i++ )); do
+        printf '%b' "$ANSI_CLEAR_LINE" >&2
+        if (( i < ${#help_lines[@]} )); then
+            printf '%b%s%b\n' "$ANSI_BOLD" "${help_lines[$i]}" "$ANSI_RESET" >&2
+        else
+            printf '\n' >&2
+        fi
+    done
+}
+
+# Master render function with FPS throttle
+render_live_window() {
+    [[ $LIVE_MODE -ne 1 ]] && return
+
+    # FPS throttle: skip if too soon since last render
+    local now
+    now=$(_live_now_ms)
+    local diff=$(( now - LIVE_LAST_RENDER_MS ))
+    if (( diff < LIVE_RENDER_INTERVAL_MS && diff >= 0 )); then
+        return
+    fi
+    LIVE_LAST_RENDER_MS="$now"
+
+    # Build full frame to minimize flicker
+    {
+        printf '%b' "$ANSI_HOME"
+        render_header
+        if [[ $LIVE_SHOW_HELP -eq 1 ]]; then
+            render_help_overlay
+        else
+            render_content
+        fi
+        render_footer
+    } 2>&1 >&2
+}
+
+# Start background keyboard listener
+start_keyboard_listener() {
+    LIVE_PIPE=$(mktemp -u /tmp/yaml_live_XXXXXX.pipe)
+    mkfifo "$LIVE_PIPE" 2>/dev/null || return 1
+
+    # Background key reader
+    (
+        local key
+        while true; do
+            # Read single char with 100ms timeout
+            if IFS= read -rsn1 -t 0.1 key 2>/dev/null; then
+                if [[ "$key" == $'\x1b' ]]; then
+                    # Escape sequence — read more
+                    local seq=""
+                    IFS= read -rsn1 -t 0.05 seq 2>/dev/null
+                    if [[ "$seq" == "[" ]]; then
+                        local code=""
+                        IFS= read -rsn1 -t 0.05 code 2>/dev/null
+                        case "$code" in
+                            A) echo "UP" > "$LIVE_PIPE" ;;     # Arrow up
+                            B) echo "DOWN" > "$LIVE_PIPE" ;;   # Arrow down
+                            H) echo "HOME" > "$LIVE_PIPE" ;;   # Home
+                            F) echo "END" > "$LIVE_PIPE" ;;    # End
+                            *)
+                                # Multi-char codes like F1-F4: [11~ [12~ etc
+                                local extra=""
+                                IFS= read -rsn2 -t 0.05 extra 2>/dev/null
+                                case "${code}${extra}" in
+                                    "11~"|"1;*P") echo "F1" > "$LIVE_PIPE" ;;
+                                    "12~"|"1;*Q") echo "F2" > "$LIVE_PIPE" ;;
+                                    "13~"|"1;*R") echo "F3" > "$LIVE_PIPE" ;;
+                                    "14~"|"1;*S") echo "F4" > "$LIVE_PIPE" ;;
+                                esac
+                                ;;
+                        esac
+                    elif [[ -z "$seq" ]]; then
+                        # Plain Escape
+                        echo "QUIT" > "$LIVE_PIPE"
+                    fi
+                else
+                    case "$key" in
+                        q|Q) echo "QUIT" > "$LIVE_PIPE" ;;
+                    esac
+                fi
+            fi
+        done
+    ) </dev/tty &
+    LIVE_KEYBOARD_PID=$!
+}
+
+# Process keyboard input (non-blocking read from pipe)
+process_keyboard_input() {
+    [[ ! -p "$LIVE_PIPE" ]] && return
+    local cmd
+    while IFS= read -r -t 0.01 cmd < "$LIVE_PIPE" 2>/dev/null; do
+        case "$cmd" in
+            QUIT)
+                cleanup_live_mode
+                exit "${1:-0}"
+                ;;
+            F1)
+                LIVE_SHOW_HELP=$(( 1 - LIVE_SHOW_HELP ))
+                render_live_window
+                ;;
+            F2)
+                LIVE_PAUSED=$(( 1 - LIVE_PAUSED ))
+                render_live_window
+                ;;
+            F3)
+                # Jump to next error in buffer
+                _live_jump_to_error
+                render_live_window
+                ;;
+            UP)
+                (( LIVE_SCROLL_OFFSET > 0 )) && (( LIVE_SCROLL_OFFSET-- ))
+                (( LIVE_SCROLL_OFFSET == 0 && ${#LIVE_BUFFER[@]} > 0 )) && LIVE_SCROLL_OFFSET=$(( ${#LIVE_BUFFER[@]} - (LIVE_TERM_ROWS - 7) ))
+                (( LIVE_SCROLL_OFFSET > 0 )) && (( LIVE_SCROLL_OFFSET-- ))
+                render_live_window
+                ;;
+            DOWN)
+                local max_off=$(( ${#LIVE_BUFFER[@]} - (LIVE_TERM_ROWS - 7) ))
+                (( max_off < 0 )) && max_off=0
+                if (( LIVE_SCROLL_OFFSET > 0 && LIVE_SCROLL_OFFSET < max_off )); then
+                    (( LIVE_SCROLL_OFFSET++ ))
+                else
+                    LIVE_SCROLL_OFFSET=0  # Auto-follow
+                fi
+                render_live_window
+                ;;
+            HOME)
+                LIVE_SCROLL_OFFSET=1
+                render_live_window
+                ;;
+            END)
+                LIVE_SCROLL_OFFSET=0  # Auto-follow mode
+                render_live_window
+                ;;
+        esac
+    done
+}
+
+# Jump to next error in buffer
+_live_jump_to_error() {
+    local content_rows=$(( LIVE_TERM_ROWS - 7 ))
+    local total=${#LIVE_BUFFER[@]}
+    local search_from=$(( LIVE_SCROLL_OFFSET > 0 ? LIVE_SCROLL_OFFSET + content_rows : total - content_rows ))
+    (( search_from < 0 )) && search_from=0
+
+    local i
+    for (( i=search_from; i<total; i++ )); do
+        if [[ "${LIVE_BUFFER[$i]}" == *"ERROR"* || "${LIVE_BUFFER[$i]}" == *"❌"* ]]; then
+            LIVE_SCROLL_OFFSET=$i
+            return
+        fi
+    done
+    # Wrap around
+    for (( i=0; i<search_from; i++ )); do
+        if [[ "${LIVE_BUFFER[$i]}" == *"ERROR"* || "${LIVE_BUFFER[$i]}" == *"❌"* ]]; then
+            LIVE_SCROLL_OFFSET=$i
+            return
+        fi
+    done
+}
+
+# Generate HTML report from buffer
+live_generate_html_report() {
+    local output="$1"
+    [[ -z "$output" ]] && return 1
+
+    {
+        cat << 'HTMLHEAD'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>YAML Validation Report</title>
+<style>
+body { font-family: 'Consolas', 'Courier New', monospace; background: #1e1e1e; color: #d4d4d4; padding: 20px; }
+.header { background: #264f78; padding: 15px; border-radius: 5px; margin-bottom: 20px; }
+.header h1 { color: #fff; margin: 0; font-size: 18px; }
+.summary { display: flex; gap: 20px; margin-bottom: 20px; }
+.stat { padding: 10px 20px; border-radius: 5px; }
+.stat-error { background: #5a1d1d; color: #f48771; }
+.stat-warn { background: #5a4b1d; color: #cca700; }
+.stat-info { background: #1d3a5a; color: #75beff; }
+.stat-ok { background: #1d5a2a; color: #89d185; }
+.line { padding: 2px 10px; white-space: pre-wrap; word-break: break-all; }
+.line-error { background: #3a1d1d; }
+.line-warn { background: #3a3a1d; }
+.line-info { background: #1d2a3a; }
+</style>
+</head>
+<body>
+<div class="header">
+<h1>YAML Validator v3.0.0 — Live Mode Report</h1>
+HTMLHEAD
+
+        printf '<p>Files: %d | Errors: %d | Warnings: %d | Info: %d</p>\n' \
+            "$LIVE_FILES_TOTAL" "$LIVE_ERRORS_LIVE" "$LIVE_WARNINGS_LIVE" "$LIVE_INFOS_LIVE"
+        printf '</div>\n<div class="summary">\n'
+        printf '<div class="stat stat-error">Errors: %d</div>\n' "$LIVE_ERRORS_LIVE"
+        printf '<div class="stat stat-warn">Warnings: %d</div>\n' "$LIVE_WARNINGS_LIVE"
+        printf '<div class="stat stat-info">Info: %d</div>\n' "$LIVE_INFOS_LIVE"
+        printf '<div class="stat stat-ok">Passed: %d</div>\n' "$PASSED_FILES"
+        printf '</div>\n<div class="output">\n'
+
+        local i cls
+        for (( i=0; i<${#LIVE_BUFFER[@]}; i++ )); do
+            local line="${LIVE_BUFFER[$i]}"
+            cls="line"
+            [[ "$line" == *"ERROR"* || "$line" == *"❌"* ]] && cls="line line-error"
+            [[ "$line" == *"WARN"* || "$line" == *"⚠"* ]] && cls="line line-warn"
+            [[ "$line" == *"INFO"* || "$line" == *"ℹ"* ]] && cls="line line-info"
+            # Escape HTML
+            line="${line//&/&amp;}"
+            line="${line//</&lt;}"
+            line="${line//>/&gt;}"
+            printf '<div class="%s">%s</div>\n' "$cls" "$line"
+        done
+
+        printf '</div>\n</body>\n</html>\n'
+    } > "$output"
+}
+
 # Reset severity counters for a new file
 reset_severity_counts() {
     SEVERITY_COUNTS[ERROR]=0
@@ -161,7 +695,29 @@ format_msg() {
         esac
     fi
 
-    echo -e "${color}${prefix}${NC} ${location}: ${message}"
+    local formatted_line="${prefix} ${location}: ${message}"
+
+    if [[ $LIVE_MODE -eq 1 ]]; then
+        # Push to live buffer instead of stdout
+        add_to_output_buffer "$formatted_line"
+        # Update live counters
+        case "$effective_severity" in
+            ERROR)   ((LIVE_ERRORS_LIVE++)) ;;
+            WARNING) ((LIVE_WARNINGS_LIVE++)) ;;
+            INFO)    ((LIVE_INFOS_LIVE++)) ;;
+        esac
+        [[ "$severity" == "SECURITY" ]] && case "$SECURITY_MODE" in
+            strict) ((LIVE_ERRORS_LIVE++)) ;;
+            normal) ((LIVE_WARNINGS_LIVE++)) ;;
+            permissive) ((LIVE_INFOS_LIVE++)) ;;
+        esac
+        # Trigger render (throttled)
+        render_live_window
+        # Process any keyboard input
+        process_keyboard_input
+    else
+        echo -e "${color}${prefix}${NC} ${location}: ${message}"
+    fi
 }
 
 # Check if file has blocking errors (should fail validation)
@@ -186,7 +742,7 @@ file_has_errors() {
 print_header() {
     echo -e "${BOLD}${CYAN}"
     echo "╔═══════════════════════════════════════════════════════════════════════╗"
-    echo "║                    YAML Validator v2.9.0                              ║"
+    echo "║                    YAML Validator v3.0.0                              ║"
     echo "║              Pure Bash Implementation for Air-Gapped Env              ║"
     echo "╚═══════════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
@@ -309,7 +865,7 @@ output_json_report() {
     fi
 
     local json_output="{
-  \"version\": \"2.8.0\",
+  \"version\": \"3.0.0\",
   \"timestamp\": \"$timestamp\",
   \"security_mode\": \"$SECURITY_MODE\",
   \"strict_mode\": $( [[ $STRICT_MODE -eq 1 ]] && echo "true" || echo "false" ),
@@ -352,6 +908,9 @@ usage() {
     --partial-schema        Включить частичную проверку типов (C31-C33)
     --all-checks            Включить все опциональные проверки
     --json                  Вывод в JSON формате (для интеграции с fix_yaml_issues.sh)
+    --live                  Живой вывод с прогресс-баром и интерактивным окном
+                            (требует интерактивный терминал; несовместим с --json)
+    --live-report html      Сохранить HTML отчёт из live режима
     -h, --help              Показать эту справку
 
 Уровни серьёзности:
@@ -6803,10 +7362,10 @@ validate_yaml_file() {
     # Reset severity counters for this file
     reset_severity_counts
 
-    [[ $JSON_OUTPUT -eq 0 && $QUIET_MODE -eq 0 ]] && echo -e "${BLUE}[ПРОВЕРЯЮ]${NC} $file"
+    [[ $JSON_OUTPUT -eq 0 && $QUIET_MODE -eq 0 && $LIVE_MODE -eq 0 ]] && echo -e "${BLUE}[ПРОВЕРЯЮ]${NC} $file"
 
     # Critical checks first
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка BOM (Byte Order Mark)...${NC}"
     fi
     local bom_errors
@@ -6816,7 +7375,7 @@ validate_yaml_file() {
         parse_errors_to_json "encoding" "BOM" "ERROR" "$bom_errors" "true" "bom"
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка на пустой файл...${NC}"
     fi
     local empty_errors
@@ -6825,7 +7384,7 @@ validate_yaml_file() {
         parse_errors_to_json "structure" "EMPTY_FILE" "ERROR" "$empty_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка кодировки Windows (CRLF)...${NC}"
     fi
     local encoding_errors
@@ -6835,7 +7394,7 @@ validate_yaml_file() {
         parse_errors_to_json "encoding" "CRLF" "ERROR" "$encoding_errors" "true" "crlf"
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка табов...${NC}"
     fi
     local tab_errors
@@ -6845,7 +7404,7 @@ validate_yaml_file() {
         parse_errors_to_json "formatting" "TABS" "ERROR" "$tab_errors" "true" "tabs"
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка пробелов в конце строк...${NC}"
     fi
     local trailing_errors
@@ -6855,7 +7414,7 @@ validate_yaml_file() {
         parse_errors_to_json "formatting" "TRAILING_WHITESPACE" "WARNING" "$trailing_errors" "true" "trailing"
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка отступов...${NC}"
     fi
     local indent_errors
@@ -6865,7 +7424,7 @@ validate_yaml_file() {
         parse_errors_to_json "formatting" "INDENTATION" "ERROR" "$indent_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка синтаксиса и скобок...${NC}"
     fi
     local syntax_errors
@@ -6875,7 +7434,7 @@ validate_yaml_file() {
         parse_errors_to_json "syntax" "BRACKETS" "ERROR" "$syntax_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка пустых ключей...${NC}"
     fi
     local empty_key_errors
@@ -6885,7 +7444,7 @@ validate_yaml_file() {
         parse_errors_to_json "structure" "EMPTY_KEYS" "ERROR" "$empty_key_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка дубликатов ключей...${NC}"
     fi
     local duplicate_errors
@@ -6895,7 +7454,7 @@ validate_yaml_file() {
         parse_errors_to_json "structure" "DUPLICATE_KEYS" "ERROR" "$duplicate_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка специальных значений (yes/no/on/off)...${NC}"
     fi
     local special_value_errors
@@ -6905,7 +7464,7 @@ validate_yaml_file() {
         parse_errors_to_json "yaml" "SPECIAL_VALUES" "WARNING" "$special_value_errors" "true" "quotes"
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка маркеров документа (---, ...)...${NC}"
     fi
     local marker_errors
@@ -6915,7 +7474,7 @@ validate_yaml_file() {
         parse_errors_to_json "structure" "DOCUMENT_MARKERS" "ERROR" "$marker_errors" "true" "doc_markers"
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка формата Kubernetes меток...${NC}"
     fi
     local label_errors
@@ -6925,7 +7484,7 @@ validate_yaml_file() {
         parse_errors_to_json "kubernetes" "LABEL_FORMAT" "ERROR" "$label_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка YAML anchors/aliases...${NC}"
     fi
     local anchor_errors
@@ -6935,7 +7494,7 @@ validate_yaml_file() {
         parse_errors_to_json "yaml" "ANCHORS_ALIASES" "ERROR" "$anchor_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка Kubernetes полей и опечаток...${NC}"
     fi
     local k8s_errors
@@ -6945,7 +7504,7 @@ validate_yaml_file() {
         parse_errors_to_json "kubernetes" "TYPOS" "ERROR" "$k8s_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка base64 в Secrets...${NC}"
     fi
     local base64_errors
@@ -6955,7 +7514,7 @@ validate_yaml_file() {
         parse_errors_to_json "kubernetes" "BASE64" "ERROR" "$base64_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка числовых форматов (octal, hex)...${NC}"
     fi
     local numeric_errors
@@ -6965,7 +7524,7 @@ validate_yaml_file() {
         parse_errors_to_json "yaml" "NUMERIC_FORMAT" "INFO" "$numeric_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка resource quantities (cpu, memory)...${NC}"
     fi
     local resource_errors
@@ -6975,7 +7534,7 @@ validate_yaml_file() {
         parse_errors_to_json "kubernetes" "RESOURCE_QUANTITIES" "ERROR" "$resource_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка диапазонов портов...${NC}"
     fi
     local port_errors
@@ -6985,7 +7544,7 @@ validate_yaml_file() {
         parse_errors_to_json "kubernetes" "PORT_RANGES" "ERROR" "$port_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка multiline блоков (|, >)...${NC}"
     fi
     local multiline_errors
@@ -6997,7 +7556,7 @@ validate_yaml_file() {
 
     # === NEW CHECKS v2.3.0 ===
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка sexagesimal (21:00 = 1260)...${NC}"
     fi
     local sexagesimal_warnings
@@ -7008,7 +7567,7 @@ validate_yaml_file() {
         parse_errors_to_json "yaml" "SEXAGESIMAL" "WARNING" "$sexagesimal_warnings" "true" "quotes"
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка Norway Problem (y/n/NO)...${NC}"
     fi
     local norway_warnings
@@ -7019,7 +7578,7 @@ validate_yaml_file() {
         parse_errors_to_json "yaml" "NORWAY_PROBLEM" "WARNING" "$norway_warnings" "true" "quotes"
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка YAML Bomb (Billion Laughs)...${NC}"
     fi
     local bomb_errors
@@ -7029,7 +7588,7 @@ validate_yaml_file() {
         parse_errors_to_json "security" "YAML_BOMB" "SECURITY" "$bomb_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка кавычек для спецсимволов...${NC}"
     fi
     local quoting_warnings
@@ -7040,7 +7599,7 @@ validate_yaml_file() {
         parse_errors_to_json "yaml" "QUOTING" "WARNING" "$quoting_warnings" "true" "quotes"
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка imagePullPolicy...${NC}"
     fi
     local pullpolicy_errors
@@ -7050,7 +7609,7 @@ validate_yaml_file() {
         parse_errors_to_json "kubernetes" "IMAGE_PULL_POLICY" "ERROR" "$pullpolicy_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка replicas (тип данных)...${NC}"
     fi
     local replicas_errors
@@ -7060,7 +7619,7 @@ validate_yaml_file() {
         parse_errors_to_json "kubernetes" "REPLICAS_TYPE" "ERROR" "$replicas_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка image tags (:latest)...${NC}"
     fi
     local imagetag_warnings
@@ -7071,7 +7630,7 @@ validate_yaml_file() {
         parse_errors_to_json "kubernetes" "IMAGE_TAGS" "WARNING" "$imagetag_warnings" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка длины labels/annotations...${NC}"
     fi
     local length_errors
@@ -7081,7 +7640,7 @@ validate_yaml_file() {
         parse_errors_to_json "kubernetes" "ANNOTATION_LENGTH" "ERROR" "$length_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка securityContext...${NC}"
     fi
     local security_warnings
@@ -7092,7 +7651,7 @@ validate_yaml_file() {
         parse_errors_to_json "security" "SECURITY_CONTEXT" "SECURITY" "$security_warnings" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка probe config...${NC}"
     fi
     local probe_warnings
@@ -7103,7 +7662,7 @@ validate_yaml_file() {
         parse_errors_to_json "kubernetes" "PROBE_CONFIG" "WARNING" "$probe_warnings" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка restartPolicy...${NC}"
     fi
     local restart_errors
@@ -7113,7 +7672,7 @@ validate_yaml_file() {
         parse_errors_to_json "kubernetes" "RESTART_POLICY" "ERROR" "$restart_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка Service type...${NC}"
     fi
     local svctype_errors
@@ -7123,7 +7682,7 @@ validate_yaml_file() {
         parse_errors_to_json "kubernetes" "SERVICE_TYPE" "ERROR" "$svctype_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка Deckhouse CRD...${NC}"
     fi
     local deckhouse_errors
@@ -7135,7 +7694,7 @@ validate_yaml_file() {
 
     # === NEW CHECKS v2.4.0 ===
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка deprecated API versions...${NC}"
     fi
     local deprecated_api_warnings
@@ -7146,7 +7705,7 @@ validate_yaml_file() {
         parse_errors_to_json "kubernetes" "DEPRECATED_API" "WARNING" "$deprecated_api_warnings" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка selector/template labels...${NC}"
     fi
     local selector_errors
@@ -7156,7 +7715,7 @@ validate_yaml_file() {
         parse_errors_to_json "kubernetes" "SELECTOR_MISMATCH" "ERROR" "$selector_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка environment variables...${NC}"
     fi
     local env_errors
@@ -7166,7 +7725,7 @@ validate_yaml_file() {
         parse_errors_to_json "kubernetes" "ENV_VARS" "ERROR" "$env_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка DNS names (RFC 1123)...${NC}"
     fi
     local dns_errors
@@ -7176,7 +7735,7 @@ validate_yaml_file() {
         parse_errors_to_json "kubernetes" "DNS_NAMES" "ERROR" "$dns_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка null values...${NC}"
     fi
     local null_warnings
@@ -7187,7 +7746,7 @@ validate_yaml_file() {
         parse_errors_to_json "yaml" "NULL_VALUES" "WARNING" "$null_warnings" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка flow style (inline JSON)...${NC}"
     fi
     local flow_errors
@@ -7197,7 +7756,7 @@ validate_yaml_file() {
         parse_errors_to_json "yaml" "FLOW_STYLE" "ERROR" "$flow_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка container names...${NC}"
     fi
     local container_name_errors
@@ -7207,7 +7766,7 @@ validate_yaml_file() {
         parse_errors_to_json "kubernetes" "CONTAINER_NAMES" "ERROR" "$container_name_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка security best practices...${NC}"
     fi
     local security_bp_warnings
@@ -7218,7 +7777,7 @@ validate_yaml_file() {
         parse_errors_to_json "security" "BEST_PRACTICES" "SECURITY" "$security_bp_warnings" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка resource format (cpu/memory)...${NC}"
     fi
     local resource_fmt_errors
@@ -7228,7 +7787,7 @@ validate_yaml_file() {
         parse_errors_to_json "kubernetes" "RESOURCE_FORMAT" "ERROR" "$resource_fmt_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка Service selector...${NC}"
     fi
     local svc_selector_warnings
@@ -7239,7 +7798,7 @@ validate_yaml_file() {
         parse_errors_to_json "kubernetes" "SERVICE_SELECTOR" "WARNING" "$svc_selector_warnings" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка volume mounts (CVE-2023-3676)...${NC}"
     fi
     local volume_errors
@@ -7249,7 +7808,7 @@ validate_yaml_file() {
         parse_errors_to_json "security" "VOLUME_MOUNTS" "SECURITY" "$volume_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка ConfigMap keys...${NC}"
     fi
     local cm_key_errors
@@ -7259,7 +7818,7 @@ validate_yaml_file() {
         parse_errors_to_json "kubernetes" "CONFIGMAP_KEYS" "ERROR" "$cm_key_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка Ingress rules...${NC}"
     fi
     local ingress_errors
@@ -7269,7 +7828,7 @@ validate_yaml_file() {
         parse_errors_to_json "kubernetes" "INGRESS_RULES" "ERROR" "$ingress_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка HPA config...${NC}"
     fi
     local hpa_errors
@@ -7279,7 +7838,7 @@ validate_yaml_file() {
         parse_errors_to_json "kubernetes" "HPA_CONFIG" "ERROR" "$hpa_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка PodDisruptionBudget...${NC}"
     fi
     local pdb_errors
@@ -7289,7 +7848,7 @@ validate_yaml_file() {
         parse_errors_to_json "kubernetes" "PDB_CONFIG" "ERROR" "$pdb_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка CronJob schedule...${NC}"
     fi
     local cronjob_errors
@@ -7301,7 +7860,7 @@ validate_yaml_file() {
 
     # === NEW CHECKS v2.5.0 ===
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка timestamp/date values...${NC}"
     fi
     local timestamp_warnings
@@ -7312,7 +7871,7 @@ validate_yaml_file() {
         parse_errors_to_json "yaml" "TIMESTAMP_VALUES" "WARNING" "$timestamp_warnings" "true" "quotes"
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка version numbers...${NC}"
     fi
     local version_warnings
@@ -7323,7 +7882,7 @@ validate_yaml_file() {
         parse_errors_to_json "yaml" "VERSION_NUMBERS" "WARNING" "$version_warnings" "true" "quotes"
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка merge keys (<<:)...${NC}"
     fi
     local merge_errors
@@ -7333,7 +7892,7 @@ validate_yaml_file() {
         parse_errors_to_json "yaml" "MERGE_KEYS" "ERROR" "$merge_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка implicit type coercion...${NC}"
     fi
     local implicit_warnings
@@ -7344,7 +7903,7 @@ validate_yaml_file() {
         parse_errors_to_json "yaml" "IMPLICIT_TYPES" "WARNING" "$implicit_warnings" "true" "quotes"
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка embedded JSON...${NC}"
     fi
     local json_errors
@@ -7356,7 +7915,7 @@ validate_yaml_file() {
 
     # === B17-B20: Additional YAML Semantics Checks (v2.7.0) ===
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка float без ведущего нуля...${NC}"
     fi
     local float_warnings
@@ -7367,7 +7926,7 @@ validate_yaml_file() {
         parse_errors_to_json "yaml" "FLOAT_LEADING_ZERO" "WARNING" "$float_warnings" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка NaN/Infinity...${NC}"
     fi
     local special_float_warnings
@@ -7378,7 +7937,7 @@ validate_yaml_file() {
         parse_errors_to_json "yaml" "SPECIAL_FLOATS" "WARNING" "$special_float_warnings" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка глубины вложенности...${NC}"
     fi
     local nesting_warnings
@@ -7389,7 +7948,7 @@ validate_yaml_file() {
         parse_errors_to_json "yaml" "NESTING_DEPTH" "WARNING" "$nesting_warnings" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка Unicode...${NC}"
     fi
     local unicode_warnings
@@ -7400,7 +7959,7 @@ validate_yaml_file() {
         parse_errors_to_json "yaml" "UNICODE_ISSUES" "WARNING" "$unicode_warnings" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка network values...${NC}"
     fi
     local network_errors
@@ -7410,7 +7969,7 @@ validate_yaml_file() {
         parse_errors_to_json "kubernetes" "NETWORK_VALUES" "ERROR" "$network_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка key naming...${NC}"
     fi
     local naming_warnings
@@ -7423,7 +7982,7 @@ validate_yaml_file() {
 
     # === NEW CHECKS v2.6.0 - PSS SECURITY ===
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка PSS Baseline...${NC}"
     fi
     local pss_baseline_warnings
@@ -7434,7 +7993,7 @@ validate_yaml_file() {
         parse_errors_to_json "security" "PSS_BASELINE" "SECURITY" "$pss_baseline_warnings" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка PSS Restricted...${NC}"
     fi
     local pss_restricted_warnings
@@ -7445,7 +8004,7 @@ validate_yaml_file() {
         parse_errors_to_json "security" "PSS_RESTRICTED" "SECURITY" "$pss_restricted_warnings" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка sensitive mounts...${NC}"
     fi
     local sensitive_mount_warnings
@@ -7457,7 +8016,7 @@ validate_yaml_file() {
     fi
 
     # === D20: Writable hostPath (v2.7.0) ===
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка writable hostPath...${NC}"
     fi
     local writable_hostpath_warnings
@@ -7469,7 +8028,7 @@ validate_yaml_file() {
     fi
 
     # === D23: drop NET_RAW capability (v2.7.0) ===
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка drop NET_RAW...${NC}"
     fi
     local net_raw_warnings
@@ -7480,7 +8039,7 @@ validate_yaml_file() {
         parse_errors_to_json "security" "DROP_NET_RAW" "SECURITY" "$net_raw_warnings" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка privileged ports...${NC}"
     fi
     local priv_port_warnings
@@ -7491,7 +8050,7 @@ validate_yaml_file() {
         parse_errors_to_json "security" "PRIVILEGED_PORTS" "SECURITY" "$priv_port_warnings" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка RBAC security...${NC}"
     fi
     local rbac_warnings
@@ -7502,7 +8061,7 @@ validate_yaml_file() {
         parse_errors_to_json "security" "RBAC_SECURITY" "SECURITY" "$rbac_warnings" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка secrets in env...${NC}"
     fi
     local secrets_env_warnings
@@ -7513,7 +8072,7 @@ validate_yaml_file() {
         parse_errors_to_json "security" "SECRETS_IN_ENV" "SECURITY" "$secrets_env_warnings" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка default ServiceAccount...${NC}"
     fi
     local default_sa_warnings
@@ -7526,7 +8085,7 @@ validate_yaml_file() {
 
     # === YAMLLINT-COMPATIBLE CHECKS v2.6.0 ===
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка длины строк...${NC}"
     fi
     local line_length_warnings
@@ -7537,7 +8096,7 @@ validate_yaml_file() {
         parse_errors_to_json "style" "LINE_LENGTH" "INFO" "$line_length_warnings" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка формата комментариев...${NC}"
     fi
     local comment_warnings
@@ -7548,7 +8107,7 @@ validate_yaml_file() {
         parse_errors_to_json "style" "COMMENT_FORMAT" "INFO" "$comment_warnings" "true" "comment_space"
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка отступов комментариев...${NC}"
     fi
     local comment_indent_warnings
@@ -7559,7 +8118,7 @@ validate_yaml_file() {
         parse_errors_to_json "style" "COMMENT_INDENTATION" "INFO" "$comment_indent_warnings" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка пустых строк...${NC}"
     fi
     local empty_line_warnings
@@ -7570,7 +8129,7 @@ validate_yaml_file() {
         parse_errors_to_json "style" "EMPTY_LINES" "INFO" "$empty_line_warnings" "true" "empty_lines"
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка newline в конце файла...${NC}"
     fi
     local eof_warnings
@@ -7581,7 +8140,7 @@ validate_yaml_file() {
         parse_errors_to_json "style" "NEWLINE_EOF" "INFO" "$eof_warnings" "true" "eof_newline"
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка пробелов у двоеточий...${NC}"
     fi
     local colon_warnings
@@ -7592,7 +8151,7 @@ validate_yaml_file() {
         parse_errors_to_json "style" "COLONS_SPACING" "INFO" "$colon_warnings" "true" "colon_spacing"
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка пробелов в скобках...${NC}"
     fi
     local bracket_warnings
@@ -7603,7 +8162,7 @@ validate_yaml_file() {
         parse_errors_to_json "style" "BRACKETS_SPACING" "INFO" "$bracket_warnings" "true" "bracket_spacing"
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка регистра boolean значений...${NC}"
     fi
     local boolean_warnings
@@ -7614,7 +8173,7 @@ validate_yaml_file() {
         parse_errors_to_json "style" "BOOLEAN_CASE" "INFO" "$boolean_warnings" "true" "booleans"
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка пробелов в списках...${NC}"
     fi
     local list_warnings
@@ -7625,7 +8184,7 @@ validate_yaml_file() {
         parse_errors_to_json "style" "LIST_SPACING" "INFO" "$list_warnings" "true" "list_spacing"
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}└─ Проверка truthy values...${NC}"
     fi
     local truthy_warnings
@@ -7687,7 +8246,7 @@ validate_yaml_file() {
     fi
 
     # E8-E19: Best practices checks
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка HA (replicas >= 3)...${NC}"
     fi
     local ha_warnings
@@ -7698,7 +8257,7 @@ validate_yaml_file() {
         parse_errors_to_json "best_practice" "HIGH_AVAILABILITY" "INFO" "$ha_warnings" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка anti-affinity...${NC}"
     fi
     local affinity_warnings
@@ -7709,7 +8268,7 @@ validate_yaml_file() {
         parse_errors_to_json "best_practice" "ANTI_AFFINITY" "INFO" "$affinity_warnings" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка rolling update strategy...${NC}"
     fi
     local strategy_warnings
@@ -7720,7 +8279,7 @@ validate_yaml_file() {
         parse_errors_to_json "best_practice" "UPDATE_STRATEGY" "INFO" "$strategy_warnings" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка дублирующихся env переменных...${NC}"
     fi
     local dup_env_warnings
@@ -7731,7 +8290,7 @@ validate_yaml_file() {
         parse_errors_to_json "best_practice" "DUPLICATE_ENV" "WARNING" "$dup_env_warnings" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка namespace...${NC}"
     fi
     local ns_warnings
@@ -7742,7 +8301,7 @@ validate_yaml_file() {
         parse_errors_to_json "best_practice" "MISSING_NAMESPACE" "INFO" "$ns_warnings" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка priorityClassName...${NC}"
     fi
     local priority_warnings
@@ -7753,7 +8312,7 @@ validate_yaml_file() {
         parse_errors_to_json "best_practice" "PRIORITY_CLASS" "INFO" "$priority_warnings" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка портов в probes...${NC}"
     fi
     local probe_port_warnings
@@ -7764,7 +8323,7 @@ validate_yaml_file() {
         parse_errors_to_json "best_practice" "PROBE_PORTS" "INFO" "$probe_port_warnings" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка ownership labels...${NC}"
     fi
     local owner_warnings
@@ -7775,7 +8334,7 @@ validate_yaml_file() {
         parse_errors_to_json "best_practice" "OWNERSHIP_LABELS" "INFO" "$owner_warnings" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}└─ Проверка dangling resources...${NC}"
     fi
     local dangling_warnings
@@ -7788,7 +8347,7 @@ validate_yaml_file() {
 
     # === NEW CHECKS v2.9.0 ===
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка resource limits...${NC}"
     fi
     local limits_warnings
@@ -7799,7 +8358,7 @@ validate_yaml_file() {
         parse_errors_to_json "best_practice" "MISSING_LIMITS" "WARNING" "$limits_warnings" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка init containers...${NC}"
     fi
     local init_errors
@@ -7815,7 +8374,7 @@ validate_yaml_file() {
         parse_errors_to_json "kubernetes" "INIT_CONTAINERS" "$init_severity" "$init_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка PVC...${NC}"
     fi
     local pvc_errors
@@ -7825,7 +8384,7 @@ validate_yaml_file() {
         parse_errors_to_json "kubernetes" "PVC_VALIDATION" "ERROR" "$pvc_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка ResourceQuota...${NC}"
     fi
     local quota_errors
@@ -7841,7 +8400,7 @@ validate_yaml_file() {
         parse_errors_to_json "kubernetes" "RESOURCE_QUOTA" "$quota_severity" "$quota_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка LimitRange...${NC}"
     fi
     local limitrange_errors
@@ -7857,7 +8416,7 @@ validate_yaml_file() {
         parse_errors_to_json "kubernetes" "LIMIT_RANGE" "$limitrange_severity" "$limitrange_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка terminationGracePeriodSeconds...${NC}"
     fi
     local grace_warnings
@@ -7868,7 +8427,7 @@ validate_yaml_file() {
         parse_errors_to_json "best_practice" "TERMINATION_GRACE" "WARNING" "$grace_warnings" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка topologySpreadConstraints...${NC}"
     fi
     local topology_errors
@@ -7878,7 +8437,7 @@ validate_yaml_file() {
         parse_errors_to_json "kubernetes" "TOPOLOGY_SPREAD" "ERROR" "$topology_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка Webhook configuration...${NC}"
     fi
     local webhook_errors
@@ -7888,7 +8447,7 @@ validate_yaml_file() {
         parse_errors_to_json "kubernetes" "WEBHOOK_CONFIG" "ERROR" "$webhook_errors" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}├─ Проверка StatefulSet volumes...${NC}"
     fi
     local stateful_warnings
@@ -7899,7 +8458,7 @@ validate_yaml_file() {
         parse_errors_to_json "best_practice" "STATEFULSET_VOLUMES" "INFO" "$stateful_warnings" "false" ""
     fi
 
-    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 ]]; then
+    if [[ $verbose -eq 1 && $JSON_OUTPUT -eq 0 && $LIVE_MODE -eq 0 ]]; then
         echo -e "  ${CYAN}└─ Проверка CronJob concurrencyPolicy...${NC}"
     fi
     local cronjob_warnings
@@ -7921,16 +8480,28 @@ validate_yaml_file() {
     [[ ${SEVERITY_COUNTS[SECURITY]} -gt 0 ]] && severity_summary+=" S:${SEVERITY_COUNTS[SECURITY]}"
 
     if [[ ${#file_errors[@]} -eq 0 ]]; then
-        [[ $JSON_OUTPUT -eq 0 && $QUIET_MODE -eq 0 ]] && echo -e "${GREEN}[✓ УСПЕХ]${NC} $file - ошибок не найдено"
+        if [[ $LIVE_MODE -eq 1 ]]; then
+            add_to_output_buffer "[✓ УСПЕХ] $file - ошибок не найдено"
+        else
+            [[ $JSON_OUTPUT -eq 0 && $QUIET_MODE -eq 0 ]] && echo -e "${GREEN}[✓ УСПЕХ]${NC} $file - ошибок не найдено"
+        fi
         ((PASSED_FILES++))
         return 0
     else
         # Check if this should be a failure based on severity mode
         if file_has_errors; then
-            [[ $JSON_OUTPUT -eq 0 && $QUIET_MODE -eq 0 ]] && echo -e "${RED}[✗ ОШИБКА]${NC} $file - обнаружены проблемы [${severity_summary# }]"
+            if [[ $LIVE_MODE -eq 1 ]]; then
+                add_to_output_buffer "[✗ ОШИБКА] $file - проблемы [${severity_summary# }]"
+            else
+                [[ $JSON_OUTPUT -eq 0 && $QUIET_MODE -eq 0 ]] && echo -e "${RED}[✗ ОШИБКА]${NC} $file - обнаружены проблемы [${severity_summary# }]"
+            fi
             ((FAILED_FILES++))
         else
-            [[ $JSON_OUTPUT -eq 0 && $QUIET_MODE -eq 0 ]] && echo -e "${YELLOW}[⚠ ПРЕДУПРЕЖДЕНИЯ]${NC} $file - найдены замечания [${severity_summary# }]"
+            if [[ $LIVE_MODE -eq 1 ]]; then
+                add_to_output_buffer "[⚠ ПРЕДУПРЕЖДЕНИЯ] $file - замечания [${severity_summary# }]"
+            else
+                [[ $JSON_OUTPUT -eq 0 && $QUIET_MODE -eq 0 ]] && echo -e "${YELLOW}[⚠ ПРЕДУПРЕЖДЕНИЯ]${NC} $file - найдены замечания [${severity_summary# }]"
+            fi
             ((PASSED_FILES++))
         fi
         ERRORS_FOUND+=("" "═══════════════════════════════════════════════════════════════════════")
@@ -8062,6 +8633,18 @@ main() {
             --partial-schema) CHECK_PARTIAL_SCHEMA=1; shift ;;
             --all-checks) CHECK_KEY_ORDERING=1; CHECK_PARTIAL_SCHEMA=1; shift ;;
             --json) JSON_OUTPUT=1; shift ;;
+            --live) LIVE_MODE=1; shift ;;
+            --live-report)
+                if [[ -z "$2" ]]; then
+                    echo -e "${RED}Ошибка: --live-report требует аргумент (html)${NC}" >&2
+                    exit 1
+                fi
+                case "$2" in
+                    html) LIVE_HTML_REPORT="yaml_live_report.html" ;;
+                    *) echo -e "${RED}Ошибка: --live-report поддерживает только 'html'${NC}" >&2; exit 1 ;;
+                esac
+                shift 2
+                ;;
             -*) echo "Неизвестная опция: $1"; usage ;;
             *) target_dir="$1"; shift ;;
         esac
@@ -8078,6 +8661,20 @@ main() {
     fi
 
     TARGET_DIR="$target_dir"
+
+    # Mutual exclusion: --live + --json
+    if [[ $LIVE_MODE -eq 1 && $JSON_OUTPUT -eq 1 ]]; then
+        echo -e "${RED}Ошибка: --live и --json нельзя использовать одновременно${NC}" >&2
+        exit 1
+    fi
+
+    # Live mode initialization
+    if [[ $LIVE_MODE -eq 1 ]]; then
+        if ! detect_terminal; then
+            echo -e "${YELLOW}Предупреждение: --live требует интерактивный терминал. Переключаюсь на обычный режим.${NC}" >&2
+            LIVE_MODE=0
+        fi
+    fi
 
     # In JSON mode or quiet mode, suppress console output
     if [[ $JSON_OUTPUT -eq 0 && $QUIET_MODE -eq 0 ]]; then
@@ -8106,21 +8703,69 @@ main() {
 
     if [[ $TOTAL_FILES -eq 0 ]]; then
         if [[ $JSON_OUTPUT -eq 1 ]]; then
-            echo '{"version":"2.8.0","error":"No YAML files found","files":[]}'
+            echo '{"version":"3.0.0","error":"No YAML files found","files":[]}'
         else
             echo -e "${YELLOW}Предупреждение: YAML файлы не найдены${NC}"
         fi
         exit 0
     fi
 
-    [[ $JSON_OUTPUT -eq 0 && $QUIET_MODE -eq 0 ]] && echo -e "${GREEN}Найдено файлов: $TOTAL_FILES${NC}"
-    [[ $JSON_OUTPUT -eq 0 && $QUIET_MODE -eq 0 ]] && echo ""
+    [[ $JSON_OUTPUT -eq 0 && $QUIET_MODE -eq 0 && $LIVE_MODE -eq 0 ]] && echo -e "${GREEN}Найдено файлов: $TOTAL_FILES${NC}"
+    [[ $JSON_OUTPUT -eq 0 && $QUIET_MODE -eq 0 && $LIVE_MODE -eq 0 ]] && echo ""
+
+    # Initialize live mode if enabled
+    if [[ $LIVE_MODE -eq 1 ]]; then
+        LIVE_FILES_TOTAL=$TOTAL_FILES
+        init_live_mode
+        start_keyboard_listener
+        add_to_output_buffer "Starting validation of $TOTAL_FILES files..."
+        add_to_output_buffer ""
+        render_live_window
+    fi
 
     for file in "${yaml_files[@]}"; do
         [[ $JSON_OUTPUT -eq 1 ]] && json_start_file "$file"
+
+        # Live mode: update file tracking
+        if [[ $LIVE_MODE -eq 1 ]]; then
+            ((LIVE_CURRENT_FILE_IDX++))
+            LIVE_CURRENT_FILE="$file"
+            add_to_output_buffer "──── $file ────"
+            render_live_window
+            # Handle pause
+            while [[ $LIVE_PAUSED -eq 1 ]]; do
+                process_keyboard_input
+                sleep 0.1
+            done
+            process_keyboard_input
+        fi
+
         validate_yaml_file "$file" "$verbose"
         [[ $JSON_OUTPUT -eq 1 ]] && json_end_file
     done
+
+    # Live mode: final render + cleanup + optional HTML
+    if [[ $LIVE_MODE -eq 1 ]]; then
+        add_to_output_buffer ""
+        add_to_output_buffer "═══ Validation complete: $TOTAL_FILES files, $PASSED_FILES passed, $FAILED_FILES failed ═══"
+        render_live_window
+
+        # Generate HTML report if requested
+        if [[ -n "$LIVE_HTML_REPORT" ]]; then
+            live_generate_html_report "$LIVE_HTML_REPORT"
+            add_to_output_buffer "HTML report saved: $LIVE_HTML_REPORT"
+            render_live_window
+        fi
+
+        # Wait for user to press Q (or auto-exit after showing results)
+        add_to_output_buffer ""
+        add_to_output_buffer "Press Q to exit..."
+        render_live_window
+        while true; do
+            process_keyboard_input
+            sleep 0.1
+        done
+    fi
 
     # Output results
     if [[ $JSON_OUTPUT -eq 1 ]]; then
