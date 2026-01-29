@@ -1,0 +1,109 @@
+# fix_yaml_issues.sh Batch Configuration File (.fixerrc)
+# Place this file in your project root or specify with --config flag
+#
+# Usage: ./fix_yaml_issues.sh --config .fixerrc /path/to/manifests
+
+# =============================================================================
+# RESOURCE PROFILES
+# =============================================================================
+# Available profiles: minimal | standard | heavy
+# This determines default CPU/memory requests and limits
+#
+# minimal:  cpu: 50m-200m,   mem: 64Mi-128Mi   (microservices, small workloads)
+# standard: cpu: 100m-1,     mem: 128Mi-512Mi  (typical applications) [DEFAULT]
+# heavy:    cpu: 500m-2,     mem: 512Mi-2Gi    (resource-intensive workloads)
+resource_profile: standard
+
+# =============================================================================
+# NAMESPACE CONFIGURATION
+# =============================================================================
+# Target namespace for replacing "namespace: default"
+# Leave empty to skip namespace replacement
+namespace: production
+
+# =============================================================================
+# HEALTH & READINESS PROBES
+# =============================================================================
+# Configuration for livenessProbe and readinessProbe
+liveness_path: /healthz
+liveness_port: 8080
+readiness_path: /ready
+readiness_port: 8080
+
+# Probe timing
+probe_initial_delay: 30   # seconds (liveness default)
+probe_period: 10          # seconds (liveness default)
+# Note: readinessProbe uses shorter defaults (5s delay, 5s period)
+
+# =============================================================================
+# SECURITY CONTEXT
+# =============================================================================
+# These are automatically added when using --config mode:
+# - privileged: false
+# - runAsNonRoot: true
+# - readOnlyRootFilesystem: true
+# - capabilities.drop: ["ALL"]
+
+# =============================================================================
+# METADATA
+# =============================================================================
+# Standard K8s labels and annotations are automatically added:
+# - app.kubernetes.io/name: <resource-name>
+# - app.kubernetes.io/version: "1.0.0"
+# - app.kubernetes.io/component: server
+# - description: "<resource-name> workload"
+
+# =============================================================================
+# HIGH AVAILABILITY
+# =============================================================================
+# Automatically creates/adds when using --config mode:
+# - PodDisruptionBudget (minAvailable: 1)
+# - podAntiAffinity (preferredDuringSchedulingIgnoredDuringExecution)
+# - topologySpreadConstraints (across zones)
+
+# =============================================================================
+# NETWORK POLICIES
+# =============================================================================
+# Automatically creates deny-all NetworkPolicy companion files
+# You must manually add allow rules after generation
+
+# =============================================================================
+# RESOURCE QUOTAS
+# =============================================================================
+# Automatically creates ResourceQuota companion files per namespace
+# Default quotas:
+# - requests.cpu: "4"
+# - requests.memory: "8Gi"
+# - limits.cpu: "8"
+# - limits.memory: "16Gi"
+# - pods: "20"
+
+# =============================================================================
+# ADVANCED CONFIGURATION
+# =============================================================================
+# You can add any key-value pairs here for future extensions
+# Example:
+# custom_label_environment: staging
+# custom_annotation_owner: team-platform
+
+# =============================================================================
+# NOTES
+# =============================================================================
+# - All K8s auto-fixes require --config or --interactive mode for safety
+# - Basic YAML fixes (BOM, CRLF, tabs, etc.) always run
+# - Companion files (NetworkPolicy, PDB, ResourceQuota) are created in same dir
+# - Existing values are preserved (no overwriting)
+# - Use --dry-run to preview changes without modifying files
+# - Use --verbose to see detailed fix information
+#
+# Example workflow:
+#   1. Review manifests with validator:
+#      ./yaml_validator.sh --json manifests/ > report.json
+#   2. Apply basic fixes:
+#      ./fix_yaml_issues.sh --from-report report.json manifests/
+#   3. Apply K8s best practices with config:
+#      ./fix_yaml_issues.sh --config .fixerrc -r manifests/
+#   4. Review changes:
+#      git diff manifests/
+#   5. Validate final result:
+#      ./yaml_validator.sh -r manifests/

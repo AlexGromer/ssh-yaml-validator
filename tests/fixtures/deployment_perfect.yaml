@@ -1,0 +1,71 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: perfect-app
+  namespace: production
+  labels:
+    app.kubernetes.io/name: perfect-app
+    app.kubernetes.io/version: "1.0.0"
+    app.kubernetes.io/component: server
+  annotations:
+    description: "Perfect deployment"
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: perfect-app
+  template:
+    metadata:
+      labels:
+        app: perfect-app
+    spec:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: perfect-app
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - perfect-app
+                topologyKey: kubernetes.io/hostname
+      containers:
+        - name: perfect-app
+          image: perfect-app:1.0.0
+          ports:
+            - containerPort: 8080
+          securityContext:
+            privileged: false
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - "ALL"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "1"
+              memory: "512Mi"
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
