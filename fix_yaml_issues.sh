@@ -4,10 +4,22 @@
 # YAML Auto-Fix Script
 # Автоматическое исправление простых ошибок в YAML файлах
 # Для использования в закрытых контурах
-# Version: 3.1.0
+# Version: 3.2.0
 #############################################################################
 
 set -o pipefail
+
+#############################################################################
+# PURE BASH FALLBACKS
+# Source external fallback library for minimal environment compatibility
+#############################################################################
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "$SCRIPT_DIR/lib/fallbacks.sh" ]]; then
+    source "$SCRIPT_DIR/lib/fallbacks.sh"
+else
+    echo "ERROR: fallbacks.sh not found. Install from: $SCRIPT_DIR/lib/" >&2
+    exit 2
+fi
 
 if [[ -t 1 ]]; then
     RED='\033[0;31m'
@@ -383,7 +395,7 @@ fix_eof_newline() {
     local found=0
 
     # Check if file doesn't end with newline
-    if [[ -s "$file" && "$(tail -c 1 "$file" | od -An -tx1 | tr -d ' ')" != "0a" ]]; then
+    if [[ -s "$file" && "$(tail -c 1 "$file" | od_compat -An -tx1 | tr -d ' ')" != "0a" ]]; then
         found=1
         [[ $QUIET_MODE -eq 0 && ($VERBOSE -eq 1 || $dry_run -eq 1) ]] && echo -e "  ${YELLOW}├─ Файл не заканчивается переводом строки${NC}"
     fi
@@ -1194,7 +1206,7 @@ fix_file() {
 
     # Check for BOM
     local first_bytes
-    first_bytes=$(head -c 3 "$file" | od -An -tx1 | tr -d ' \n')
+    first_bytes=$(head -c 3 "$file" | od_compat -An -tx1 | tr -d ' \n')
     if [[ "$first_bytes" == "efbbbf" ]]; then
         has_bom=1
         [[ $QUIET_MODE -eq 0 && ($VERBOSE -eq 1 || $interactive -eq 1) ]] && echo -e "  ${YELLOW}├─ Обнаружен BOM (Byte Order Mark)${NC}"
@@ -1266,7 +1278,11 @@ fix_file() {
     if [[ $has_tabs -eq 1 ]] && should_fix "tabs" "$allowed_fixes"; then
         if [[ $dry_run -eq 0 ]]; then
             local temp_file="${file}.tmp.$$"
-            expand -t 2 "$file" > "$temp_file"
+            if ! expand_compat -t 2 "$file" > "$temp_file"; then
+                echo -e "${RED}Ошибка: Не удалось заменить табы в файле $file${NC}" >&2
+                rm -f "$temp_file"
+                return 1
+            fi
             mv "$temp_file" "$file"
             [[ $QUIET_MODE -eq 0 ]] && echo -e "  ${GREEN}├─ [✓] Табы -> Пробелы${NC}"
             ((FIX_COUNTS[tabs]++))

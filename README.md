@@ -1,6 +1,6 @@
 # YAML Validator для изолированных контуров
 
-**Version: 2.9.0** | Pure Bash | Zero Dependencies | **Coverage: 99.7%**
+**Version: 3.2.0** | Pure Bash | Full Autonomy | **Coverage: 99.7%**
 
 Валидатор YAML файлов для закрытых сред без доступа к интернету и возможности установки дополнительных утилит.
 
@@ -56,6 +56,35 @@ chmod +x yaml_validator.sh fix_yaml_issues.sh
 # Интерактивный режим (для security fixes)
 ./fix_yaml_issues.sh -i config.yaml
 ```
+
+---
+
+## Зависимости
+
+### Обязательные (всегда требуются)
+- **Bash**: 4.0+ (проверено на 4.3+, 5.x)
+- **Базовые утилиты**: grep, sed, awk, head, tail, cat, tr, wc, sort, uniq
+
+### Опциональные (автоматический fallback на pure bash)
+Скрипты автоматически используют pure bash fallback-функции, если команды недоступны:
+
+| Команда | Назначение | Fallback | Статус |
+|---------|-----------|----------|--------|
+| **realpath** | Канонизация путей | `realpath_fallback()` | ✅ v3.2.0 |
+| **expand** | Tabs → пробелы | `expand_fallback()` | ✅ v3.2.0 |
+| **od** | Hex dump (BOM, EOF) | `od_fallback()` → xxd → pure bash | ✅ v3.2.0 |
+| **tput** | Размер терминала | `tput_fallback()` | ✅ v3.2.0 |
+| **jq** | JSON-парсинг | bash arrays | ✅ Graceful |
+| **yq** | YAML-парсинг | regex fallback | ✅ Graceful |
+| **yamllint** | Расширенная валидация | skip | ✅ Graceful |
+
+**Совместимость**: Скрипты работают на минимальных системах:
+- ✅ BusyBox (Alpine Linux, embedded)
+- ✅ Air-gapped environments (закрытые контуры)
+- ✅ Older Linux distributions (без modern utils)
+- ✅ Astra Linux SE 1.7 (Smolensk)
+
+**Fallback-функции** находятся в `lib/fallbacks.sh` и автоматически загружаются при запуске.
 
 ---
 
