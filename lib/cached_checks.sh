@@ -1885,7 +1885,7 @@ check_termination_grace_cached() {
             fi
 
             if [[ $grace -gt 3600 ]]; then
-                warnings+=("Строка $line_num: Очень длинный grace period: ${grace}s (${((grace/60))}мин)")
+                warnings+=("Строка $line_num: Очень длинный grace period: ${grace}s ($((grace/60))мин)")
                 warnings+=("  Может замедлить rolling updates")
             fi
         fi
