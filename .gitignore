@@ -2,6 +2,10 @@
 yaml_validation_report.txt
 *.bak
 
+# Backups
+*.backup-*
+*.pre-*
+
 # Temp files
 *.tmp
 *.tmp.*
