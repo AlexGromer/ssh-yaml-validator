@@ -24,7 +24,7 @@ else
 fi
 
 #############################################################################
-# PERFORMANCE OPTIMIZATION: Cached Check Functions (v3.3.0)
+# PERFORMANCE OPTIMIZATION: Cached Check Functions (v3.3.1)
 #############################################################################
 # Source performance-optimized cached check functions
 # These eliminate 99% of redundant file I/O operations
@@ -295,7 +295,7 @@ render_header() {
     printf '%b%b%s%s%s%b\n' "$ANSI_FG_CYAN" "$BOX_TL" "$border_h" "$BOX_TR" "" "$ANSI_RESET" >&2
 
     # Title line
-    local title=" YAML Validator v3.3.0 — Live Mode"
+    local title=" YAML Validator v3.3.1 — Live Mode"
     local time_str
     printf -v time_str "%02d:%02d" "$mins" "$secs"
     local pad=$(( inner - ${#title} - ${#time_str} - 1 ))
@@ -618,7 +618,7 @@ body { font-family: 'Consolas', 'Courier New', monospace; background: #1e1e1e; c
 </head>
 <body>
 <div class="header">
-<h1>YAML Validator v3.3.0 — Live Mode Report</h1>
+<h1>YAML Validator v3.3.1 — Live Mode Report</h1>
 HTMLHEAD
 
         printf '<p>Files: %d | Errors: %d | Warnings: %d | Info: %d</p>\n' \
@@ -765,7 +765,7 @@ file_has_errors() {
 print_header() {
     echo -e "${BOLD}${CYAN}"
     echo "╔═══════════════════════════════════════════════════════════════════════╗"
-    echo "║                    YAML Validator v3.3.0                              ║"
+    echo "║                    YAML Validator v3.3.1                              ║"
     echo "║              Pure Bash Implementation for Air-Gapped Env              ║"
     echo "╚═══════════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
@@ -935,7 +935,7 @@ usage() {
                             (требует интерактивный терминал; несовместим с --json)
     --live-report html      Сохранить HTML отчёт из live режима
 
-    Performance Optimization (v3.3.0):
+    Performance Optimization (v3.3.1):
     --parallel              Принудительно включить параллельную обработку (4-8x speedup)
     --no-parallel           Отключить параллельную обработку (для отладки)
     --parallel-jobs N       Количество параллельных процессов (по умолчанию: nproc)
@@ -968,7 +968,7 @@ usage() {
     $0 --fix --recursive manifests/                  # Валидация + автоисправление
     $0 --quiet config.yaml && echo "OK"              # Для скриптов
 
-    Performance Optimization Examples (v3.3.0):
+    Performance Optimization Examples (v3.3.1):
     $0 --parallel --recursive manifests/             # Параллельная обработка
     $0 --incremental --recursive manifests/          # Инкрементальная валидация
     $0 --incremental --parallel manifests/           # Обе оптимизации (макс. скорость)
@@ -7403,7 +7403,7 @@ validate_yaml_file() {
     reset_severity_counts
 
     # ====================================================================
-    # PERFORMANCE OPTIMIZATION: File Content Caching (v3.3.0)
+    # PERFORMANCE OPTIMIZATION: File Content Caching (v3.3.1)
     # ====================================================================
     # Cache file content ONCE instead of reading 101 times (once per check)
     # Expected speedup: 10-20x (eliminates 100/101 redundant file reads)
@@ -7569,7 +7569,12 @@ validate_yaml_file() {
         echo -e "  ${CYAN}├─ Проверка Kubernetes полей и опечаток...${NC}"
     fi
     local k8s_errors
-    if ! k8s_errors=$(check_kubernetes_specific "$file"); then
+    if declare -F check_kubernetes_specific_cached >/dev/null 2>&1; then
+        k8s_errors=$(check_kubernetes_specific_cached FILE_LINES "$file")
+    else
+        k8s_errors=$(check_kubernetes_specific "$file")
+    fi
+    if [[ -n "$k8s_errors" ]]; then
         file_errors+=("=== KUBERNETES: РАСШИРЕННАЯ ПРОВЕРКА ===")
         file_errors+=("$k8s_errors")
         parse_errors_to_json "kubernetes" "TYPOS" "ERROR" "$k8s_errors" "false" ""
@@ -7653,7 +7658,7 @@ validate_yaml_file() {
         echo -e "  ${CYAN}├─ Проверка YAML Bomb (Billion Laughs)...${NC}"
     fi
     local bomb_errors
-    if ! bomb_errors=$(check_yaml_bomb "$file"); then
+    if ! bomb_errors=$(if declare -F check_yaml_bomb_cached >/dev/null 2>&1; then check_yaml_bomb_cached FILE_LINES "$file"; else check_yaml_bomb "$file"; fi); then
         file_errors+=("=== БЕЗОПАСНОСТЬ: YAML BOMB ===")
         file_errors+=("$bomb_errors")
         parse_errors_to_json "security" "YAML_BOMB" "SECURITY" "$bomb_errors" "false" ""
@@ -7663,7 +7668,7 @@ validate_yaml_file() {
         echo -e "  ${CYAN}├─ Проверка кавычек для спецсимволов...${NC}"
     fi
     local quoting_warnings
-    quoting_warnings=$(check_string_quoting "$file")
+    quoting_warnings=$(if declare -F check_string_quoting_cached >/dev/null 2>&1; then check_string_quoting_cached FILE_LINES "$file"; else check_string_quoting "$file"; fi)
     if [[ -n "$quoting_warnings" ]]; then
         file_errors+=("=== YAML: КАВЫЧКИ ===")
         file_errors+=("$quoting_warnings")
@@ -7715,7 +7720,7 @@ validate_yaml_file() {
         echo -e "  ${CYAN}├─ Проверка securityContext...${NC}"
     fi
     local security_warnings
-    security_warnings=$(check_security_context "$file")
+    if declare -F check_security_context_cached >/dev/null 2>&1; then security_warnings=$(check_security_context_cached FILE_LINES "$file"); else security_warnings=$(check_security_context "$file"); fi
     if [[ -n "$security_warnings" ]]; then
         file_errors+=("=== БЕЗОПАСНОСТЬ: SECURITY CONTEXT ===")
         file_errors+=("$security_warnings")
@@ -7726,7 +7731,7 @@ validate_yaml_file() {
         echo -e "  ${CYAN}├─ Проверка probe config...${NC}"
     fi
     local probe_warnings
-    probe_warnings=$(check_probe_config "$file")
+    if declare -F check_probe_config_cached >/dev/null 2>&1; then probe_warnings=$(check_probe_config_cached FILE_LINES "$file"); else probe_warnings=$(check_probe_config "$file"); fi
     if [[ -n "$probe_warnings" ]]; then
         file_errors+=("=== KUBERNETES: PROBES ===")
         file_errors+=("$probe_warnings")
@@ -7737,7 +7742,7 @@ validate_yaml_file() {
         echo -e "  ${CYAN}├─ Проверка restartPolicy...${NC}"
     fi
     local restart_errors
-    if ! restart_errors=$(check_restart_policy "$file"); then
+    if ! restart_errors=$(if declare -F check_restart_policy_cached >/dev/null 2>&1; then check_restart_policy_cached FILE_LINES "$file"; else check_restart_policy "$file"; fi); then
         file_errors+=("=== KUBERNETES: RESTARTPOLICY ===")
         file_errors+=("$restart_errors")
         parse_errors_to_json "kubernetes" "RESTART_POLICY" "ERROR" "$restart_errors" "false" ""
@@ -7747,7 +7752,12 @@ validate_yaml_file() {
         echo -e "  ${CYAN}├─ Проверка Service type...${NC}"
     fi
     local svctype_errors
-    if ! svctype_errors=$(check_service_type "$file"); then
+    if declare -F check_service_type_cached >/dev/null 2>&1; then
+        svctype_errors=$(check_service_type_cached FILE_LINES "$file")
+    else
+        svctype_errors=$(check_service_type "$file")
+    fi
+    if [[ -n "$svctype_errors" ]]; then
         file_errors+=("=== KUBERNETES: SERVICE TYPE ===")
         file_errors+=("$svctype_errors")
         parse_errors_to_json "kubernetes" "SERVICE_TYPE" "ERROR" "$svctype_errors" "false" ""
@@ -7780,7 +7790,7 @@ validate_yaml_file() {
         echo -e "  ${CYAN}├─ Проверка selector/template labels...${NC}"
     fi
     local selector_errors
-    if ! selector_errors=$(check_selector_match "$file"); then
+    if ! selector_errors=$(if declare -F check_selector_match_cached >/dev/null 2>&1; then check_selector_match_cached FILE_LINES "$file"; else check_selector_match "$file"; fi); then
         file_errors+=("=== KUBERNETES: SELECTOR MISMATCH ===")
         file_errors+=("$selector_errors")
         parse_errors_to_json "kubernetes" "SELECTOR_MISMATCH" "ERROR" "$selector_errors" "false" ""
@@ -7841,7 +7851,7 @@ validate_yaml_file() {
         echo -e "  ${CYAN}├─ Проверка security best practices...${NC}"
     fi
     local security_bp_warnings
-    security_bp_warnings=$(check_security_best_practices "$file")
+    security_bp_warnings=$(if declare -F check_security_best_practices_cached >/dev/null 2>&1; then check_security_best_practices_cached FILE_LINES "$file"; else check_security_best_practices "$file"; fi)
     if [[ -n "$security_bp_warnings" ]]; then
         file_errors+=("=== БЕЗОПАСНОСТЬ: BEST PRACTICES ===")
         file_errors+=("$security_bp_warnings")
@@ -7852,7 +7862,7 @@ validate_yaml_file() {
         echo -e "  ${CYAN}├─ Проверка resource format (cpu/memory)...${NC}"
     fi
     local resource_fmt_errors
-    if ! resource_fmt_errors=$(check_resource_format "$file"); then
+    if ! resource_fmt_errors=$(if declare -F check_resource_format_cached >/dev/null 2>&1; then check_resource_format_cached FILE_LINES "$file"; else check_resource_format "$file"; fi); then
         file_errors+=("=== KUBERNETES: RESOURCE FORMAT ===")
         file_errors+=("$resource_fmt_errors")
         parse_errors_to_json "kubernetes" "RESOURCE_FORMAT" "ERROR" "$resource_fmt_errors" "false" ""
@@ -7862,7 +7872,7 @@ validate_yaml_file() {
         echo -e "  ${CYAN}├─ Проверка Service selector...${NC}"
     fi
     local svc_selector_warnings
-    svc_selector_warnings=$(check_service_selector "$file")
+    svc_selector_warnings=$(if declare -F check_service_selector_cached >/dev/null 2>&1; then check_service_selector_cached FILE_LINES "$file"; else check_service_selector "$file"; fi)
     if [[ -n "$svc_selector_warnings" ]]; then
         file_errors+=("=== KUBERNETES: SERVICE SELECTOR ===")
         file_errors+=("$svc_selector_warnings")
@@ -7873,7 +7883,7 @@ validate_yaml_file() {
         echo -e "  ${CYAN}├─ Проверка volume mounts (CVE-2023-3676)...${NC}"
     fi
     local volume_errors
-    if ! volume_errors=$(check_volume_mounts "$file"); then
+    if ! volume_errors=$(if declare -F check_volume_mounts_cached >/dev/null 2>&1; then check_volume_mounts_cached FILE_LINES "$file"; else check_volume_mounts "$file"; fi); then
         file_errors+=("=== БЕЗОПАСНОСТЬ: VOLUME MOUNTS ===")
         file_errors+=("$volume_errors")
         parse_errors_to_json "security" "VOLUME_MOUNTS" "SECURITY" "$volume_errors" "false" ""
@@ -7935,7 +7945,7 @@ validate_yaml_file() {
         echo -e "  ${CYAN}├─ Проверка timestamp/date values...${NC}"
     fi
     local timestamp_warnings
-    timestamp_warnings=$(check_timestamp_values "$file")
+    timestamp_warnings=$(if declare -F check_timestamp_values_cached >/dev/null 2>&1; then check_timestamp_values_cached FILE_LINES "$file"; else check_timestamp_values "$file"; fi)
     if [[ -n "$timestamp_warnings" ]]; then
         file_errors+=("=== YAML: TIMESTAMP VALUES ===")
         file_errors+=("$timestamp_warnings")
@@ -7946,7 +7956,7 @@ validate_yaml_file() {
         echo -e "  ${CYAN}├─ Проверка version numbers...${NC}"
     fi
     local version_warnings
-    version_warnings=$(check_version_numbers "$file")
+    version_warnings=$(if declare -F check_version_numbers_cached >/dev/null 2>&1; then check_version_numbers_cached FILE_LINES "$file"; else check_version_numbers "$file"; fi)
     if [[ -n "$version_warnings" ]]; then
         file_errors+=("=== YAML: VERSION NUMBERS ===")
         file_errors+=("$version_warnings")
@@ -8001,7 +8011,7 @@ validate_yaml_file() {
         echo -e "  ${CYAN}├─ Проверка NaN/Infinity...${NC}"
     fi
     local special_float_warnings
-    special_float_warnings=$(check_special_floats "$file" "$STRICT_MODE")
+    special_float_warnings=$(if declare -F check_special_floats_cached >/dev/null 2>&1; then check_special_floats_cached FILE_LINES "$file"; else check_special_floats "$file" "$STRICT_MODE"; fi)
     if [[ -n "$special_float_warnings" ]]; then
         file_errors+=("=== YAML: SPECIAL FLOATS ===")
         file_errors+=("$special_float_warnings")
@@ -8023,7 +8033,7 @@ validate_yaml_file() {
         echo -e "  ${CYAN}├─ Проверка Unicode...${NC}"
     fi
     local unicode_warnings
-    unicode_warnings=$(check_unicode_normalization "$file")
+    unicode_warnings=$(if declare -F check_unicode_normalization_cached >/dev/null 2>&1; then check_unicode_normalization_cached FILE_LINES "$file"; else check_unicode_normalization "$file"; fi)
     if [[ -n "$unicode_warnings" ]]; then
         file_errors+=("=== YAML: UNICODE ISSUES ===")
         file_errors+=("$unicode_warnings")
@@ -8034,7 +8044,12 @@ validate_yaml_file() {
         echo -e "  ${CYAN}├─ Проверка network values...${NC}"
     fi
     local network_errors
-    if ! network_errors=$(check_network_values "$file"); then
+    if declare -F check_network_values_cached >/dev/null 2>&1; then
+        network_errors=$(check_network_values_cached FILE_LINES "$file")
+    else
+        network_errors=$(check_network_values "$file")
+    fi
+    if [[ -n "$network_errors" ]]; then
         file_errors+=("=== KUBERNETES: NETWORK VALUES ===")
         file_errors+=("$network_errors")
         parse_errors_to_json "kubernetes" "NETWORK_VALUES" "ERROR" "$network_errors" "false" ""
@@ -8057,7 +8072,7 @@ validate_yaml_file() {
         echo -e "  ${CYAN}├─ Проверка PSS Baseline...${NC}"
     fi
     local pss_baseline_warnings
-    pss_baseline_warnings=$(check_pss_baseline "$file")
+    if declare -F check_pss_baseline_cached >/dev/null 2>&1; then pss_baseline_warnings=$(check_pss_baseline_cached FILE_LINES "$file"); else pss_baseline_warnings=$(check_pss_baseline "$file"); fi
     if [[ -n "$pss_baseline_warnings" ]]; then
         file_errors+=("=== БЕЗОПАСНОСТЬ: PSS BASELINE ===")
         file_errors+=("$pss_baseline_warnings")
@@ -8068,7 +8083,7 @@ validate_yaml_file() {
         echo -e "  ${CYAN}├─ Проверка PSS Restricted...${NC}"
     fi
     local pss_restricted_warnings
-    pss_restricted_warnings=$(check_pss_restricted "$file")
+    if declare -F check_pss_restricted_cached >/dev/null 2>&1; then pss_restricted_warnings=$(check_pss_restricted_cached FILE_LINES "$file"); else pss_restricted_warnings=$(check_pss_restricted "$file"); fi
     if [[ -n "$pss_restricted_warnings" ]]; then
         file_errors+=("=== БЕЗОПАСНОСТЬ: PSS RESTRICTED ===")
         file_errors+=("$pss_restricted_warnings")
@@ -8079,7 +8094,7 @@ validate_yaml_file() {
         echo -e "  ${CYAN}├─ Проверка sensitive mounts...${NC}"
     fi
     local sensitive_mount_warnings
-    sensitive_mount_warnings=$(check_sensitive_mounts "$file")
+    sensitive_mount_warnings=$(if declare -F check_sensitive_mounts_cached >/dev/null 2>&1; then check_sensitive_mounts_cached FILE_LINES "$file"; else check_sensitive_mounts "$file"; fi)
     if [[ -n "$sensitive_mount_warnings" ]]; then
         file_errors+=("=== БЕЗОПАСНОСТЬ: SENSITIVE MOUNTS ===")
         file_errors+=("$sensitive_mount_warnings")
@@ -8091,7 +8106,7 @@ validate_yaml_file() {
         echo -e "  ${CYAN}├─ Проверка writable hostPath...${NC}"
     fi
     local writable_hostpath_warnings
-    writable_hostpath_warnings=$(check_writable_hostpath "$file")
+    writable_hostpath_warnings=$(if declare -F check_writable_hostpath_cached >/dev/null 2>&1; then check_writable_hostpath_cached FILE_LINES "$file"; else check_writable_hostpath "$file"; fi)
     if [[ -n "$writable_hostpath_warnings" ]]; then
         file_errors+=("=== БЕЗОПАСНОСТЬ: WRITABLE HOSTPATH ===")
         file_errors+=("$writable_hostpath_warnings")
@@ -8125,7 +8140,7 @@ validate_yaml_file() {
         echo -e "  ${CYAN}├─ Проверка RBAC security...${NC}"
     fi
     local rbac_warnings
-    rbac_warnings=$(check_rbac_security "$file")
+    if declare -F check_rbac_security_cached >/dev/null 2>&1; then rbac_warnings=$(check_rbac_security_cached FILE_LINES "$file"); else rbac_warnings=$(check_rbac_security "$file"); fi
     if [[ -n "$rbac_warnings" ]]; then
         file_errors+=("=== БЕЗОПАСНОСТЬ: RBAC ===")
         file_errors+=("$rbac_warnings")
@@ -8136,7 +8151,7 @@ validate_yaml_file() {
         echo -e "  ${CYAN}├─ Проверка secrets in env...${NC}"
     fi
     local secrets_env_warnings
-    secrets_env_warnings=$(check_secrets_in_env "$file")
+    if declare -F check_secrets_in_env_cached >/dev/null 2>&1; then secrets_env_warnings=$(check_secrets_in_env_cached FILE_LINES "$file"); else secrets_env_warnings=$(check_secrets_in_env "$file"); fi
     if [[ -n "$secrets_env_warnings" ]]; then
         file_errors+=("=== БЕЗОПАСНОСТЬ: SECRETS IN ENV ===")
         file_errors+=("$secrets_env_warnings")
@@ -8147,7 +8162,7 @@ validate_yaml_file() {
         echo -e "  ${CYAN}├─ Проверка default ServiceAccount...${NC}"
     fi
     local default_sa_warnings
-    default_sa_warnings=$(check_default_service_account "$file")
+    if declare -F check_default_service_account_cached >/dev/null 2>&1; then default_sa_warnings=$(check_default_service_account_cached FILE_LINES "$file"); else default_sa_warnings=$(check_default_service_account "$file"); fi
     if [[ -n "$default_sa_warnings" ]]; then
         file_errors+=("=== БЕЗОПАСНОСТЬ: SERVICE ACCOUNT ===")
         file_errors+=("$default_sa_warnings")
@@ -8259,7 +8274,7 @@ validate_yaml_file() {
         echo -e "  ${CYAN}└─ Проверка truthy values...${NC}"
     fi
     local truthy_warnings
-    truthy_warnings=$(check_truthy_values "$file")
+    truthy_warnings=$(if declare -F check_truthy_values_cached >/dev/null 2>&1; then check_truthy_values_cached FILE_LINES "$file"; else check_truthy_values "$file"; fi)
     if [[ -n "$truthy_warnings" ]]; then
         file_errors+=("=== YAML: TRUTHY VALUES ===")
         file_errors+=("$truthy_warnings")
@@ -8343,7 +8358,7 @@ validate_yaml_file() {
         echo -e "  ${CYAN}├─ Проверка rolling update strategy...${NC}"
     fi
     local strategy_warnings
-    strategy_warnings=$(check_rolling_update "$file")
+    strategy_warnings=$(if declare -F check_rolling_update_cached >/dev/null 2>&1; then check_rolling_update_cached FILE_LINES "$file"; else check_rolling_update "$file"; fi)
     if [[ -n "$strategy_warnings" ]]; then
         file_errors+=("=== BEST PRACTICE: UPDATE STRATEGY ===")
         file_errors+=("$strategy_warnings")
@@ -8459,7 +8474,7 @@ validate_yaml_file() {
         echo -e "  ${CYAN}├─ Проверка ResourceQuota...${NC}"
     fi
     local quota_errors
-    quota_errors=$(check_resource_quota "$file")
+    quota_errors=$(if declare -F check_resource_quota_cached >/dev/null 2>&1; then check_resource_quota_cached FILE_LINES "$file"; else check_resource_quota "$file"; fi)
     if [[ -n "$quota_errors" ]]; then
         file_errors+=("=== KUBERNETES: RESOURCE QUOTA ===")
         file_errors+=("$quota_errors")
